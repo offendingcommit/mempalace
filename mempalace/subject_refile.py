@@ -141,6 +141,7 @@ def _report(rows: list[dict[str, Any]], router: SubjectRouter) -> dict[str, Any]
         "schema": "mempalace-subject-refile/v1",
         "subject_policy": router.fingerprint,
         "policy_version": router.version,
+        "plan_sha256": _plan_sha256(rows),
         "eligible_drawers": len(rows),
         "moved_drawers": moved,
         "unchanged_drawers": len(rows) - moved,
@@ -151,6 +152,29 @@ def _report(rows: list[dict[str, Any]], router: SubjectRouter) -> dict[str, Any]
             for (old, new), count in sorted(transitions.items())
         ],
     }
+
+
+def _plan_sha256(rows: list[dict[str, Any]]) -> str:
+    """Fingerprint the exact content and metadata plan without disclosing either."""
+
+    plan = [
+        {
+            "id": row["id"],
+            "document": row["document"],
+            "metadata": row["metadata"],
+            "target_room": row["route"].room,
+            "route_method": row["route"].method,
+            "route_score": float(row["route"].score),
+        }
+        for row in sorted(rows, key=lambda item: item["id"])
+    ]
+    payload = json.dumps(
+        plan,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
 
 
 def _apply_rows(collection, rows: list[dict[str, Any]], router: SubjectRouter) -> None:
