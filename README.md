@@ -140,6 +140,38 @@ mempalace search "why did we switch to GraphQL"
 mempalace wake-up
 ```
 
+### Policy-versioned subject filing
+
+Bulk miners can file each drawer-sized chunk into a controlled subject room
+instead of assigning one room to an entire source file. Set
+`MEMPALACE_SUBJECT_ROOMS_JSON` to a versioned policy, then opt in with
+`--subject-routing`:
+
+```bash
+mempalace mine /retained/workspace --wing wing_agent --subject-routing
+mempalace mine /retained/conversations --mode convos \
+  --wing wing_agent --extract exchange --subject-routing
+```
+
+Named systems can route on bounded exact keywords. Broader subjects use the
+configured local embedding model. The policy must name a visible fallback room
+for low-confidence or tied results, so ambiguous drawers remain reviewable
+instead of being guessed into a generic bucket. The policy fingerprint is
+stored on every routed drawer and includes the configured embedding-model
+identity. Conversation generation identity includes that fingerprint, making
+a policy or model change a complete, idempotent source-generation change rather
+than mixing taxonomy or model eras.
+
+Operators can preview or apply metadata-only cleanup to an existing retained
+project source through the raw MCP tool `mempalace_subject_refile`. Set
+`MEMPALACE_SUBJECT_REFILE_ROOTS_JSON` to the exact retained roots the operator
+may select. The tool fails closed for parents and unlisted roots. It preserves
+drawer IDs, text, and embeddings, rebuilds wing- and room-scoped closets, keeps
+a durable rollback journal during apply, and defaults to `dry_run=true`. Take a
+storage recovery point and review the content-free transition counts before
+applying it. Deployments should keep the raw tool behind an operator-only
+boundary and expose narrower policy adapters to agents.
+
 For Claude Code, Gemini CLI, [Antigravity](https://mempalaceofficial.com/guide/antigravity.html),
 MCP-compatible tools, and local models, see
 [mempalaceofficial.com/guide/getting-started](https://mempalaceofficial.com/guide/getting-started.html).
@@ -269,7 +301,7 @@ PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 MIT — see [LICENSE](LICENSE).
 
 <!-- Link Definitions -->
-[version-shield]: https://img.shields.io/badge/version-3.6.0+oc.1-4dc9f6?style=flat-square&labelColor=0a0e14
+[version-shield]: https://img.shields.io/badge/version-3.6.0+oc.2-4dc9f6?style=flat-square&labelColor=0a0e14
 [release-link]: https://github.com/MemPalace/mempalace/releases
 [python-shield]: https://img.shields.io/badge/python-3.9+-7dd8f8?style=flat-square&labelColor=0a0e14&logo=python&logoColor=7dd8f8
 [python-link]: https://www.python.org/

@@ -576,6 +576,7 @@ def test_cmd_mine_projects_mode(mock_config_cls):
             respect_gitignore=True,
             include_ignored=[],
             max_chunks_per_file=None,
+            subject_routing=False,
         )
 
 
@@ -604,6 +605,7 @@ def test_cmd_mine_convos_mode(mock_config_cls):
             limit=10,
             dry_run=True,
             extract_mode="general",
+            subject_routing=False,
         )
 
 
