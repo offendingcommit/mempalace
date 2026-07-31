@@ -86,11 +86,54 @@ def test_dry_run_reports_content_free_room_transitions(tmp_path):
     assert report["eligible_drawers"] == 2
     assert report["moved_drawers"] == 2
     assert report["destinations"] == {"health": 1, "music": 1}
+    assert report["plan_sha256"].startswith("sha256:")
     assert report["transitions"] == [
         {"from": "continuity", "to": "music", "count": 1},
         {"from": "work", "to": "health", "count": 1},
     ]
     assert "document" not in str(report)
+
+
+def test_plan_fingerprint_binds_exact_drawer_content_and_metadata(tmp_path):
+    palace = tmp_path / "palace"
+    source = tmp_path / "source"
+    collection = _seed(palace, source)
+
+    first = subject_refile(
+        str(palace),
+        str(source),
+        "wing_daphne",
+        router=FakeRouter(),
+        dry_run=True,
+        allowed_source_roots=[str(source)],
+    )
+    collection.update(
+        ids=["drawer-one"],
+        documents=["changed but still exact music evidence"],
+    )
+
+    class ChangedRouter(FakeRouter):
+        def route_many(self, texts):
+            return [
+                SubjectRoute(
+                    "music" if "music" in text else "health",
+                    "semantic" if "music" in text else "keyword",
+                    0.81 if "music" in text else 2.0,
+                )
+                for text in texts
+            ]
+
+    second = subject_refile(
+        str(palace),
+        str(source),
+        "wing_daphne",
+        router=ChangedRouter(),
+        dry_run=True,
+        allowed_source_roots=[str(source)],
+    )
+
+    assert first["transitions"] == second["transitions"]
+    assert first["plan_sha256"] != second["plan_sha256"]
 
 
 def test_apply_changes_only_room_metadata_and_preserves_drawer_vectors(tmp_path):
