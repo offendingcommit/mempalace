@@ -396,6 +396,7 @@ _MUTATING_TOOLS = frozenset(
         "mempalace_checkpoint",
         "mempalace_delete_by_source",
         "mempalace_mine",
+        "mempalace_subject_refile",
         "mempalace_commit_applied_coverage",
         "mempalace_sync",
         "mempalace_update_drawer",
@@ -2782,6 +2783,7 @@ def tool_mine(
     limit: int = 0,
     dry_run: bool = False,
     extract: str = "exchange",
+    subject_routing: bool = False,
 ):
     """Mine a directory into the palace — the MCP equivalent of ``mempalace mine``.
 
@@ -2841,6 +2843,7 @@ def tool_mine(
                 limit=limit,
                 dry_run=dry_run,
                 extract_mode=extract,
+                subject_routing=subject_routing,
             )
         if mode == "extract":
             from .format_miner import mine_formats
@@ -2862,6 +2865,7 @@ def tool_mine(
             agent=agent,
             limit=limit,
             dry_run=dry_run,
+            subject_routing=subject_routing,
         )
 
     try:
@@ -2933,6 +2937,7 @@ def tool_normalized_conversation_delta(
     source: str,
     wing: str,
     extract: str = "exchange",
+    subject_routing: bool = False,
 ):
     """Return a read-only normalized-source reconciliation report."""
 
@@ -2947,14 +2952,48 @@ def tool_normalized_conversation_delta(
         return {"success": False, "error": f"source directory not found: {source!r}"}
     try:
         from .convo_miner import normalized_conversation_delta
+        from .subject_router import SubjectRouter
 
         report = normalized_conversation_delta(
             src,
             _config.palace_path,
             wing=sanitize_name(wing, "wing"),
             extract_mode=extract,
+            subject_router=SubjectRouter.from_env() if subject_routing else None,
         )
         return {"success": True, "dry_run": True, "report": report}
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": str(exc),
+            "error_class": type(exc).__name__,
+        }
+
+
+def tool_subject_refile(source: str, wing: str, dry_run: bool = True):
+    """Plan or apply stable-subject metadata cleanup for one retained corpus."""
+
+    if not _config.palace_path:
+        return {
+            "success": False,
+            "error": "no palace configured",
+            "error_class": "PalaceNotConfigured",
+        }
+    src = os.path.expanduser(source) if source else ""
+    if not src or not os.path.isdir(src):
+        return {"success": False, "error": f"source directory not found: {source!r}"}
+    try:
+        from .subject_refile import subject_refile
+        from .subject_router import SubjectRouter
+
+        report = subject_refile(
+            _config.palace_path,
+            src,
+            sanitize_name(wing, "wing"),
+            router=SubjectRouter.from_env(),
+            dry_run=dry_run,
+        )
+        return {"success": True, "dry_run": dry_run, "report": report}
     except Exception as exc:
         return {
             "success": False,
@@ -4513,6 +4552,13 @@ TOOLS = {
                         "Ignored by other modes."
                     ),
                 },
+                "subject_routing": {
+                    "type": "boolean",
+                    "description": (
+                        "Route each drawer-sized chunk through the configured stable-subject "
+                        "policy. Ambiguous chunks go to its review room. Default: false."
+                    ),
+                },
             },
             "required": ["source"],
         },
@@ -4534,10 +4580,35 @@ TOOLS = {
                     "enum": ["exchange"],
                     "description": "Normalized conversations support exchange mode only.",
                 },
+                "subject_routing": {
+                    "type": "boolean",
+                    "description": "Include the configured subject policy in delta identity.",
+                },
             },
             "required": ["source", "wing"],
         },
         "handler": tool_normalized_conversation_delta,
+    },
+    "mempalace_subject_refile": {
+        "description": (
+            "Operator-only stable-subject cleanup for retained project drawers. "
+            "The default dry run returns a content-free room transition report. "
+            "Apply updates room metadata and closets without changing drawer text or embeddings."
+        ),
+        "input_schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "source": {"type": "string", "description": "Retained source directory."},
+                "wing": {"type": "string", "description": "Exact destination wing."},
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "Return the transition plan without writing. Default: true.",
+                },
+            },
+            "required": ["source", "wing"],
+        },
+        "handler": tool_subject_refile,
     },
     "mempalace_commit_applied_coverage": {
         "description": (

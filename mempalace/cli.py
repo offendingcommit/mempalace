@@ -568,6 +568,7 @@ def cmd_mine(args):
             "include_ignored": include_ignored,
             "max_chunks_per_file": getattr(args, "max_chunks_per_file", None),
             "redetect_origin": getattr(args, "redetect_origin", False),
+            "subject_routing": getattr(args, "subject_routing", False),
         }
         _submit_daemon_cli_job("mine", payload, args, background=getattr(args, "background", False))
         return
@@ -596,6 +597,7 @@ def cmd_mine(args):
                 limit=args.limit,
                 dry_run=args.dry_run,
                 extract_mode=args.extract,
+                subject_routing=getattr(args, "subject_routing", False),
             )
         elif args.mode == "extract":
             from .format_miner import mine_formats
@@ -621,6 +623,7 @@ def cmd_mine(args):
                 respect_gitignore=not args.no_gitignore,
                 include_ignored=include_ignored,
                 max_chunks_per_file=getattr(args, "max_chunks_per_file", None),
+                subject_routing=getattr(args, "subject_routing", False),
             )
     except MineAlreadyRunning as exc:
         # A live MCP server or another mine is already writing to this
@@ -1860,6 +1863,14 @@ def main():
         choices=["exchange", "general"],
         default="exchange",
         help="Extraction strategy for convos mode: 'exchange' (default) or 'general' (5 memory types)",
+    )
+    p_mine.add_argument(
+        "--subject-routing",
+        action="store_true",
+        help=(
+            "Route drawer-sized chunks through MEMPALACE_SUBJECT_ROOMS_JSON. "
+            "Ambiguous content lands in the configured review room."
+        ),
     )
 
     p_mine.add_argument(

@@ -641,6 +641,48 @@ def test_run_mine_invalid_mode_returns_structured_error(tmp_path):
     assert out["exit_code"] == 2
 
 
+def test_run_mine_forwards_subject_routing_to_conversation_miner(tmp_path, monkeypatch):
+    import mempalace.convo_miner as convo_miner
+    from mempalace import service
+
+    captured = {}
+    monkeypatch.setattr(
+        convo_miner, "mine_convos", lambda **kwargs: captured.update(kwargs)
+    )
+
+    out = service.run_mine(
+        {
+            "palace_path": str(tmp_path / "palace"),
+            "source": str(tmp_path),
+            "mode": "convos",
+            "subject_routing": True,
+        }
+    )
+
+    assert out["success"] is True
+    assert captured["subject_routing"] is True
+
+
+def test_run_mine_forwards_subject_routing_to_project_miner(tmp_path, monkeypatch):
+    import mempalace.miner as miner
+    from mempalace import service
+
+    captured = {}
+    monkeypatch.setattr(miner, "mine", lambda **kwargs: captured.update(kwargs))
+
+    out = service.run_mine(
+        {
+            "palace_path": str(tmp_path / "palace"),
+            "source": str(tmp_path),
+            "mode": "projects",
+            "subject_routing": True,
+        }
+    )
+
+    assert out["success"] is True
+    assert captured["subject_routing"] is True
+
+
 def test_run_mcp_tool_rejects_non_dict_arguments():
     from mempalace import service
 

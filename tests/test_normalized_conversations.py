@@ -370,6 +370,124 @@ def test_miner_stamps_normalized_room_chronology_and_source_version(tmp_path):
     assert metadata["source_chunk_count"] == 1
 
 
+def test_subject_routing_files_each_exchange_into_its_stable_subject(tmp_path, monkeypatch):
+    import chromadb
+
+    import mempalace.convo_miner as convo_miner
+    from mempalace.subject_router import SubjectRoute
+
+    source = tmp_path / "source"
+    source.mkdir()
+    transcript = (
+        '<!-- mempalace-exchange {"messages":['
+        '{"id":"41","role":"user","timestamp":"2026-07-29T23:55:00Z"},'
+        '{"id":"42","role":"assistant","timestamp":"2026-07-29T23:56:00Z"}]} -->\n'
+        "> first subject question\nFirst subject answer.\n"
+        '<!-- mempalace-exchange {"messages":['
+        '{"id":"43","role":"user","timestamp":"2026-07-30T00:04:00Z"},'
+        '{"id":"44","role":"assistant","timestamp":"2026-07-30T00:05:00Z"}]} -->\n'
+        "> second subject question\nSecond subject answer.\n"
+    )
+    transcript_path, _, _, _ = _write_pair(source, transcript=transcript)
+    palace = tmp_path / "palace"
+
+    class FakeRouter:
+        fingerprint = "sha256:" + "a" * 64
+
+        def route_many(self, texts):
+            assert len(texts) == 2
+            return [
+                SubjectRoute("music", "semantic", 0.82),
+                SubjectRoute("hermes", "keyword", 2.0),
+            ]
+
+    monkeypatch.setattr(convo_miner.SubjectRouter, "from_env", lambda: FakeRouter())
+
+    convo_miner.mine_convos(str(source), str(palace), wing="wing_amber", subject_routing=True)
+
+    collection = chromadb.PersistentClient(path=str(palace)).get_collection("mempalace_drawers")
+    rows = collection.get(
+        where={"source_file": str(transcript_path.resolve())}, include=["metadatas"]
+    )
+    assert {metadata["room"] for metadata in rows["metadatas"]} == {"music", "hermes"}
+    assert {metadata["subject_policy"] for metadata in rows["metadatas"]} == {
+        FakeRouter.fingerprint
+    }
+    assert {metadata["source_version"] for metadata in rows["metadatas"]} != {
+        metadata["source_generation"] for metadata in rows["metadatas"]
+    }
+
+
+def test_subject_policy_change_replaces_one_complete_normalized_generation(
+    tmp_path, monkeypatch, capsys
+):
+    import chromadb
+
+    import mempalace.convo_miner as convo_miner
+    from mempalace.subject_router import SubjectRoute
+
+    source = tmp_path / "source"
+    source.mkdir()
+    transcript = (
+        '<!-- mempalace-exchange {"messages":['
+        '{"id":"41","role":"user","timestamp":"2026-07-29T23:55:00Z"},'
+        '{"id":"42","role":"assistant","timestamp":"2026-07-29T23:56:00Z"}]} -->\n'
+        "> first subject question\nFirst subject answer.\n"
+        '<!-- mempalace-exchange {"messages":['
+        '{"id":"43","role":"user","timestamp":"2026-07-30T00:04:00Z"},'
+        '{"id":"44","role":"assistant","timestamp":"2026-07-30T00:05:00Z"}]} -->\n'
+        "> second subject question\nSecond subject answer.\n"
+    )
+    transcript_path, _, _, _ = _write_pair(source, transcript=transcript)
+    palace = tmp_path / "palace"
+
+    class PolicyRouter:
+        def __init__(self, fingerprint, room):
+            self.fingerprint = fingerprint
+            self.room = room
+
+        def route_many(self, texts):
+            return [SubjectRoute(self.room, "semantic", 0.8) for _text in texts]
+
+    active = {"router": PolicyRouter("sha256:" + "a" * 64, "music")}
+    monkeypatch.setattr(
+        convo_miner.SubjectRouter, "from_env", lambda: active["router"]
+    )
+
+    convo_miner.mine_convos(
+        str(source), str(palace), wing="wing_amber", subject_routing=True
+    )
+    capsys.readouterr()
+    collection = chromadb.PersistentClient(path=str(palace)).get_collection(
+        "mempalace_drawers"
+    )
+    first = collection.get(
+        where={"source_file": str(transcript_path.resolve())}, include=["metadatas"]
+    )
+    first_ids = set(first["ids"])
+
+    convo_miner.mine_convos(
+        str(source), str(palace), wing="wing_amber", subject_routing=True
+    )
+    assert "Files skipped (already filed): 1" in capsys.readouterr().out
+
+    active["router"] = PolicyRouter("sha256:" + "b" * 64, "health")
+    convo_miner.mine_convos(
+        str(source), str(palace), wing="wing_amber", subject_routing=True
+    )
+    assert "Files skipped (already filed): 0" in capsys.readouterr().out
+    second = collection.get(
+        where={"source_file": str(transcript_path.resolve())}, include=["metadatas"]
+    )
+
+    assert len(second["ids"]) == 2
+    assert first_ids.isdisjoint(second["ids"])
+    assert {metadata["room"] for metadata in second["metadatas"]} == {"health"}
+    assert {metadata["subject_policy"] for metadata in second["metadatas"]} == {
+        active["router"].fingerprint
+    }
+
+
 def test_sidecar_only_change_rebuilds_stable_source_path(tmp_path, capsys):
     import chromadb
 

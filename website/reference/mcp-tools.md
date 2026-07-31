@@ -142,6 +142,7 @@ Mine a directory into the palace — the MCP equivalent of `mempalace mine`. Wra
 | `limit` | integer | No | Max files to process (0 = all; default 0) |
 | `dry_run` | boolean | No | Report what would be filed without writing (default false) |
 | `extract` | string | No | Convos extraction strategy: `exchange` (default) or `general`; ignored by other modes |
+| `subject_routing` | boolean | No | Route each drawer-sized project or conversation chunk through `MEMPALACE_SUBJECT_ROOMS_JSON`; ambiguous chunks use the policy's review room (default false) |
 
 **Returns:** `{ success, mode, dry_run, output }` on success (`output` is the miner's human-readable summary; `output_truncated: true` is added when a very large summary is tail-trimmed), or `{ success: false, error, error_class? }` on failure.
 
@@ -159,8 +160,36 @@ does not alter the source directory, palace drawers, or applied watermark.
 | `source` | string | **Yes** | Normalized transcript staging directory |
 | `wing` | string | **Yes** | Exact destination wing |
 | `extract` | string | No | Must be `exchange` when present |
+| `subject_routing` | boolean | No | Include the configured subject-policy fingerprint in generation identity and drawer projections |
 
 **Returns:** `{ success, dry_run: true, report: { new, changed, unchanged, removed, new_drawers, replacement_drawers, changed_drawers, removed_drawers, net_drawers } }`
+
+---
+
+### `mempalace_subject_refile`
+
+Operator-only, content-preserving room cleanup for drawers already mined from
+one retained project source. Each eligible drawer is routed independently
+through `MEMPALACE_SUBJECT_ROOMS_JSON`. Conversation imports, manual drawers,
+and sources outside the exact retained root are excluded. Allowed roots must be
+listed exactly in `MEMPALACE_SUBJECT_REFILE_ROOTS_JSON`; selecting a parent or
+unlisted root fails closed. The default dry run returns only policy identity
+and room-level counts. Apply updates room and subject-policy metadata, preserves
+drawer IDs, verbatim text, and embeddings, then rebuilds wing- and room-scoped
+closets. A durable journal restores the previous metadata and closet coverage
+if apply is interrupted; rerunning apply completes that recovery first.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `source` | string | **Yes** | Exact retained project source directory |
+| `wing` | string | **Yes** | Exact wing whose source-backed drawers may be refiled |
+| `dry_run` | boolean | No | Preview content-free destination and transition counts (default true) |
+
+**Returns:** `{ success, dry_run, report: { schema, subject_policy, policy_version, eligible_drawers, moved_drawers, unchanged_drawers, destinations, route_methods, transitions, wing, source, dry_run } }`
+
+Take a storage recovery point and review the exact dry-run report before
+passing `dry_run=false`. Keep this raw tool behind operator authentication and
+give agents a narrower policy adapter instead of raw-server credentials.
 
 ---
 

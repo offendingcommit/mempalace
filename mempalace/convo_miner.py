@@ -8,12 +8,15 @@ Normalizes format, chunks by exchange pair (Q+A = one unit), files to palace.
 Same palace as project mining. Different ingest strategy.
 """
 
+from __future__ import annotations
+
 import os
 import sys
 import json
+import hashlib
 import logging
 import stat
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from itertools import islice
@@ -45,6 +48,7 @@ from .palace import (
     mine_palace_lock,
     prefetch_mined_set,
 )
+from .subject_router import SubjectRouter
 
 logger = logging.getLogger("mempalace_mcp")
 
@@ -193,8 +197,17 @@ def _source_file_delete_ids(collection, source_file: str, extract_mode: str) -> 
     return ids
 
 
-def _normalized_generation_key(source_version: str, chunk_size: int) -> tuple:
-    return (source_version, chunk_size, NORMALIZE_VERSION, ID_RECIPE)
+def _subject_generation(source_version: str, subject_policy: str = "") -> str:
+    """Bind a normalized source generation to the filing policy that routed it."""
+
+    if not subject_policy:
+        return source_version
+    payload = f"mempalace-subject-generation/v1\0{source_version}\0{subject_policy}".encode()
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def _normalized_generation_key(source_generation: str, chunk_size: int) -> tuple:
+    return (source_generation, chunk_size, NORMALIZE_VERSION, ID_RECIPE)
 
 
 @dataclass
@@ -209,7 +222,7 @@ class NormalizedSourceState:
     expected_by_generation: dict = field(default_factory=lambda: defaultdict(set))
 
     def record(self, metadata: dict, drawer_id: Optional[str] = None) -> None:
-        version = metadata.get("source_version")
+        version = metadata.get("source_generation") or metadata.get("source_version")
         chunk_size = metadata.get("source_chunk_size")
         generation = (
             version,
@@ -328,6 +341,7 @@ def normalized_conversation_delta(
     *,
     wing: str,
     extract_mode: str = "exchange",
+    subject_router: Optional[SubjectRouter] = None,
 ) -> dict:
     """Report normalized source reconciliation without writing palace state."""
 
@@ -348,7 +362,7 @@ def normalized_conversation_delta(
         rows = connection.execute(
             """
             SELECT sf.string_value,
-                   sv.string_value,
+                   COALESCE(sg.string_value, sv.string_value),
                    scs.int_value,
                    nv.int_value,
                    ir.string_value,
@@ -368,6 +382,8 @@ def normalized_conversation_delta(
                 ON ns.id = e.id AND ns.key = 'normalized_schema'
               LEFT JOIN embedding_metadata sv
                 ON sv.id = e.id AND sv.key = 'source_version'
+              LEFT JOIN embedding_metadata sg
+                ON sg.id = e.id AND sg.key = 'source_generation'
               LEFT JOIN embedding_metadata scs
                 ON scs.id = e.id AND scs.key = 'source_chunk_size'
               LEFT JOIN embedding_metadata nv
@@ -381,7 +397,7 @@ def normalized_conversation_delta(
              WHERE c.name = ?
                AND w.string_value = ?
                AND ns.string_value = ?
-             GROUP BY sf.string_value, sv.string_value, scs.int_value,
+             GROUP BY sf.string_value, sg.string_value, sv.string_value, scs.int_value,
                       nv.int_value, ir.string_value, scc.int_value,
                       em.string_value
             """,
@@ -438,7 +454,10 @@ def normalized_conversation_delta(
         )
         source_state = stored.get(source_file, NormalizedSourceState())
         complete = source_state.is_only_complete(
-            conversation.source_version,
+            _subject_generation(
+                conversation.source_version,
+                subject_router.fingerprint if subject_router is not None else "",
+            ),
             palace_config.chunk_size,
         )
         if complete:
@@ -783,6 +802,7 @@ def _file_chunks_locked(
     normalized: Optional[NormalizedConversation] = None,
     chunk_count: Optional[int] = None,
     source_chunk_size: Optional[int] = None,
+    subject_policy: str = "",
 ):
     """Lock one source and replace it without removing the last complete generation.
 
@@ -799,6 +819,11 @@ def _file_chunks_locked(
     drawers_added = 0
     expected_chunk_count = len(chunks) if chunk_count is None else chunk_count
     normalized_chunk_size = source_chunk_size if source_chunk_size is not None else 0
+    source_generation = (
+        _subject_generation(normalized.source_version, subject_policy)
+        if normalized is not None
+        else ""
+    )
     with mine_lock(source_file):
         # Re-check after lock — another agent may have just finished this file
         # at the current schema/mtime. A stale hit here returns False, so we
@@ -812,7 +837,7 @@ def _file_chunks_locked(
                 collect_ids=True,
             )
             already_mined = source_state.is_only_complete(
-                normalized.source_version,
+                source_generation,
                 normalized_chunk_size,
             )
         else:
@@ -834,12 +859,12 @@ def _file_chunks_locked(
             except Exception:
                 logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
         elif not source_state.generation_is_complete(
-            normalized.source_version,
+            source_generation,
             normalized_chunk_size,
             expected_chunk_count,
         ):
             incomplete_target_ids = source_state.ids_by_generation.get(
-                _normalized_generation_key(normalized.source_version, normalized_chunk_size),
+                _normalized_generation_key(source_generation, normalized_chunk_size),
                 [],
             )
             if incomplete_target_ids:
@@ -851,7 +876,7 @@ def _file_chunks_locked(
                     extract_mode,
                 )
                 if cleared.counts_by_generation.get(
-                    _normalized_generation_key(normalized.source_version, normalized_chunk_size),
+                    _normalized_generation_key(source_generation, normalized_chunk_size),
                     0,
                 ):
                     raise RuntimeError("normalized target-generation purge left stale drawer(s)")
@@ -866,7 +891,7 @@ def _file_chunks_locked(
         except OSError:
             source_mtime = None
         target_needs_upsert = normalized is None or not source_state.generation_is_complete(
-            normalized.source_version,
+            source_generation,
             normalized_chunk_size,
             expected_chunk_count,
         )
@@ -876,8 +901,12 @@ def _file_chunks_locked(
             batch_ids: list = []
             batch_metas: list = []
             for chunk in batch:
-                chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
-                if extract_mode == "general":
+                chunk_room = (
+                    chunk.get("memory_type", room)
+                    if extract_mode == "general"
+                    else chunk.get("room", room)
+                )
+                if extract_mode == "general" or subject_policy:
                     room_counts_delta[chunk_room] += 1
                 drawer_id = make_convo_drawer_id(
                     wing,
@@ -885,7 +914,7 @@ def _file_chunks_locked(
                     source_file,
                     extract_mode,
                     chunk["chunk_index"],
-                    source_version=(normalized.source_version if normalized is not None else None),
+                    source_version=(source_generation if normalized is not None else None),
                     source_chunk_size=normalized_chunk_size,
                     normalize_version=NORMALIZE_VERSION,
                     id_recipe=ID_RECIPE,
@@ -936,6 +965,15 @@ def _file_chunks_locked(
                             "normalized_schema": normalized.metadata.schema,
                         }
                     )
+                    if subject_policy:
+                        meta.update(
+                            {
+                                "source_generation": source_generation,
+                                "subject_policy": subject_policy,
+                                "subject_route": chunk.get("subject_route", "unfiled"),
+                                "subject_score": float(chunk.get("subject_score", 0.0)),
+                            }
+                        )
                 batch_metas.append(meta)
             assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
             try:
@@ -958,7 +996,7 @@ def _file_chunks_locked(
                 collect_ids=True,
             )
             if not staged.generation_is_complete(
-                normalized.source_version,
+                source_generation,
                 normalized_chunk_size,
                 expected_chunk_count,
             ):
@@ -967,7 +1005,7 @@ def _file_chunks_locked(
                 drawer_id
                 for generation, version_ids in staged.ids_by_generation.items()
                 if generation
-                != _normalized_generation_key(normalized.source_version, normalized_chunk_size)
+                != _normalized_generation_key(source_generation, normalized_chunk_size)
                 for drawer_id in version_ids
             ]
             if stale_ids:
@@ -979,7 +1017,7 @@ def _file_chunks_locked(
                 extract_mode,
             )
             if not committed.is_only_complete(
-                normalized.source_version,
+                source_generation,
                 normalized_chunk_size,
             ):
                 raise RuntimeError("normalized source replacement left stale drawer(s)")
@@ -1070,6 +1108,7 @@ def mine_convos(
     limit: int = 0,
     dry_run: bool = False,
     extract_mode: str = "exchange",
+    subject_routing: bool = False,
 ):
     """Mine a directory of conversation files into the palace.
 
@@ -1102,6 +1141,7 @@ def mine_convos(
             limit=limit,
             dry_run=dry_run,
             extract_mode=extract_mode,
+            subject_routing=subject_routing,
         )
 
     with mine_palace_lock(palace_path):
@@ -1113,6 +1153,7 @@ def mine_convos(
             limit=limit,
             dry_run=dry_run,
             extract_mode=extract_mode,
+            subject_routing=subject_routing,
         )
 
 
@@ -1148,10 +1189,13 @@ def _conversation_source_is_unchanged(
     chunk_size: int,
     mined_mtimes: dict,
     normalized_states: dict,
+    subject_policy: str = "",
 ) -> bool:
     if probe is not None:
         state = normalized_states.get(source_file, NormalizedSourceState())
-        return state.is_only_complete(probe.source_version, chunk_size)
+        return state.is_only_complete(
+            _subject_generation(probe.source_version, subject_policy), chunk_size
+        )
     return _is_unchanged_since_last_mine(source_file, mined_mtimes)
 
 
@@ -1200,6 +1244,52 @@ def _prefetch_conversation_states(files, collection, dry_run: bool, wing: str, e
     return mined_mtimes, normalized_states
 
 
+def _route_conversation_chunks(chunks, router: SubjectRouter | None):
+    if router is None:
+        return chunks
+
+    def routed_chunks():
+        chunk_iterator = iter(chunks)
+        while batch := list(islice(chunk_iterator, DRAWER_UPSERT_BATCH_SIZE)):
+            routes = router.route_many([chunk["content"] for chunk in batch])
+            if len(routes) != len(batch):
+                raise RuntimeError("subject router did not classify every conversation chunk")
+            for chunk, route in zip(batch, routes):
+                chunk["room"] = route.room
+                chunk["subject_route"] = route.method
+                chunk["subject_score"] = route.score
+                yield chunk
+
+    return routed_chunks()
+
+
+def _print_conversation_dry_run(
+    filepath: Path,
+    chunks,
+    chunk_count: int,
+    extract_mode: str,
+    room: str | None,
+    subject_routing: bool,
+) -> Counter:
+    counts: Counter = Counter()
+    if extract_mode == "general":
+        counts.update(chunk.get("memory_type", "general") for chunk in chunks)
+        types = ", ".join(f"{name}:{count}" for name, count in counts.most_common())
+        print(f"    [DRY RUN] {filepath.name} → {chunk_count} memories ({types})")
+        return counts
+    if subject_routing:
+        counts.update(chunk["room"] for chunk in chunks)
+        rooms = ", ".join(
+            f"{name}:{count}"
+            for name, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+        )
+        print(f"    [DRY RUN] {filepath.name} → {chunk_count} drawers ({rooms})")
+        return counts
+    counts[room] += 1
+    print(f"    [DRY RUN] {filepath.name} → room:{room} ({chunk_count} drawers)")
+    return counts
+
+
 def _mine_convos_impl(
     convo_dir: str,
     palace_path: str,
@@ -1208,10 +1298,13 @@ def _mine_convos_impl(
     limit: int = 0,
     dry_run: bool = False,
     extract_mode: str = "exchange",
+    subject_routing: bool = False,
 ):
     from .config import MempalaceConfig
 
     palace_config = MempalaceConfig(palace_path=palace_path)
+    subject_router = SubjectRouter.from_env() if subject_routing else None
+    subject_policy = subject_router.fingerprint if subject_router is not None else ""
     cfg_chunk_size = palace_config.chunk_size
     # Only override convo_miner's MIN_CHUNK_SIZE when the user has set
     # min_chunk_size explicitly. min_chunk_size_explicit returns the
@@ -1286,6 +1379,7 @@ def _mine_convos_impl(
             cfg_chunk_size,
             mined_mtimes,
             normalized_states,
+            subject_policy,
         ):
             files_skipped += 1
             continue
@@ -1333,6 +1427,8 @@ def _mine_convos_impl(
             else len(chunks)
         )
 
+        chunks = _route_conversation_chunks(chunks, subject_router)
+
         if chunk_count == 0:
             if not dry_run:
                 _register_file(collection, source_file, wing, agent, extract_mode)
@@ -1342,27 +1438,23 @@ def _mine_convos_impl(
         room = _conversation_room(content, normalized, extract_mode)
 
         if dry_run:
-            if extract_mode == "general":
-                from collections import Counter
-
-                type_counts = Counter(c.get("memory_type", "general") for c in chunks)
-                types_str = ", ".join(f"{t}:{n}" for t, n in type_counts.most_common())
-                print(f"    [DRY RUN] {filepath.name} → {len(chunks)} memories ({types_str})")
-            else:
-                print(f"    [DRY RUN] {filepath.name} → room:{room} ({chunk_count} drawers)")
             total_drawers += chunk_count
-            # Track room counts
-            if extract_mode == "general":
-                for c in chunks:
-                    room_counts[c.get("memory_type", "general")] += 1
-            else:
-                room_counts[room] += 1
+            room_counts.update(
+                _print_conversation_dry_run(
+                    filepath,
+                    chunks,
+                    chunk_count,
+                    extract_mode,
+                    room,
+                    subject_router is not None,
+                )
+            )
             files_mined += 1
             if limit > 0 and files_mined >= limit:
                 break
             continue
 
-        if extract_mode != "general":
+        if extract_mode != "general" and subject_router is None:
             room_counts[room] += 1
 
         # Lock + reconcile stale + file fresh chunks. The lock serializes
@@ -1379,6 +1471,7 @@ def _mine_convos_impl(
             normalized=normalized,
             chunk_count=chunk_count,
             source_chunk_size=(cfg_chunk_size if normalized is not None else None),
+            subject_policy=subject_policy,
         )
         if skipped:
             files_skipped += 1
