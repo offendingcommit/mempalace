@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -407,6 +408,7 @@ def subject_refile(
     *,
     router: SubjectRouter,
     dry_run: bool = True,
+    expected_plan_sha256: str | None = None,
     allowed_source_roots: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Plan or apply a recoverable metadata refile without changing drawer text."""
@@ -425,6 +427,14 @@ def subject_refile(
         rows = _eligible_rows(collection, source_root, wing)
         _route_rows(rows, router)
         report = _report(rows, router)
+        if not dry_run:
+            if (
+                not isinstance(expected_plan_sha256, str)
+                or not re.fullmatch(r"sha256:[0-9a-f]{64}", expected_plan_sha256)
+            ):
+                raise SubjectRefileError("apply requires an expected plan SHA-256")
+            if report["plan_sha256"] != expected_plan_sha256:
+                raise SubjectRefileError("subject refile plan changed before apply")
         report.update(
             {
                 "wing": wing,
