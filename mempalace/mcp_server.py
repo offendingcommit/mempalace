@@ -2970,7 +2970,12 @@ def tool_normalized_conversation_delta(
         }
 
 
-def tool_subject_refile(source: str, wing: str, dry_run: bool = True):
+def tool_subject_refile(
+    source: str,
+    wing: str,
+    dry_run: bool = True,
+    expected_plan_sha256: str | None = None,
+):
     """Plan or apply stable-subject metadata cleanup for one retained corpus."""
 
     if not _config.palace_path:
@@ -2992,6 +2997,7 @@ def tool_subject_refile(source: str, wing: str, dry_run: bool = True):
             sanitize_name(wing, "wing"),
             router=SubjectRouter.from_env(),
             dry_run=dry_run,
+            expected_plan_sha256=expected_plan_sha256,
         )
         return {"success": True, "dry_run": dry_run, "report": report}
     except Exception as exc:
@@ -4604,6 +4610,11 @@ TOOLS = {
                 "dry_run": {
                     "type": "boolean",
                     "description": "Return the transition plan without writing. Default: true.",
+                },
+                "expected_plan_sha256": {
+                    "type": "string",
+                    "pattern": "^sha256:[0-9a-f]{64}$",
+                    "description": "Exact dry-run plan required when applying.",
                 },
             },
             "required": ["source", "wing"],

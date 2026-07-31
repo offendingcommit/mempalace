@@ -69,6 +69,17 @@ def _seed(palace: Path, source: Path):
     return collection
 
 
+def _dry_plan(palace: Path, source: Path) -> str:
+    return subject_refile(
+        str(palace),
+        str(source),
+        "wing_daphne",
+        router=FakeRouter(),
+        dry_run=True,
+        allowed_source_roots=[str(source)],
+    )["plan_sha256"]
+
+
 def test_dry_run_reports_content_free_room_transitions(tmp_path):
     palace = tmp_path / "palace"
     source = tmp_path / "source"
@@ -163,6 +174,7 @@ def test_apply_changes_only_room_metadata_and_preserves_drawer_vectors(tmp_path)
         "wing_daphne",
         router=FakeRouter(),
         dry_run=False,
+        expected_plan_sha256=_dry_plan(palace, source),
         allowed_source_roots=[str(source)],
     )
     after = collection.get(
@@ -215,6 +227,7 @@ def test_failed_apply_rolls_back_drawer_metadata_and_clears_journal(tmp_path, mo
     source = tmp_path / "source"
     collection = _seed(palace, source)
     before = collection.get(ids=["drawer-one", "drawer-two"], include=["metadatas"])
+    expected_plan_sha256 = _dry_plan(palace, source)
     real_rebuild = refile_module._rebuild_closets
     calls = 0
 
@@ -234,6 +247,7 @@ def test_failed_apply_rolls_back_drawer_metadata_and_clears_journal(tmp_path, mo
             "wing_daphne",
             router=FakeRouter(),
             dry_run=False,
+            expected_plan_sha256=expected_plan_sha256,
             allowed_source_roots=[str(source)],
         )
 
@@ -250,6 +264,7 @@ def test_apply_recovers_an_interrupted_journal_before_refiling(tmp_path):
     palace = tmp_path / "palace"
     source = tmp_path / "source"
     collection = _seed(palace, source)
+    expected_plan_sha256 = _dry_plan(palace, source)
     rows = refile_module._eligible_rows(collection, source.resolve(), "wing_daphne")
     refile_module._route_rows(rows, FakeRouter())
     refile_module._write_journal(
@@ -266,6 +281,7 @@ def test_apply_recovers_an_interrupted_journal_before_refiling(tmp_path):
         "wing_daphne",
         router=FakeRouter(),
         dry_run=False,
+        expected_plan_sha256=expected_plan_sha256,
         allowed_source_roots=[str(source)],
     )
 
@@ -275,6 +291,32 @@ def test_apply_recovers_an_interrupted_journal_before_refiling(tmp_path):
     assert {metadata["subject_policy"] for metadata in after["metadatas"]} == {
         FakeRouter.fingerprint
     }
+
+
+def test_apply_rejects_missing_or_changed_expected_plan(tmp_path):
+    palace = tmp_path / "palace"
+    source = tmp_path / "source"
+    _seed(palace, source)
+
+    with pytest.raises(SubjectRefileError, match="requires an expected plan"):
+        subject_refile(
+            str(palace),
+            str(source),
+            "wing_daphne",
+            router=FakeRouter(),
+            dry_run=False,
+            allowed_source_roots=[str(source)],
+        )
+    with pytest.raises(SubjectRefileError, match="plan changed"):
+        subject_refile(
+            str(palace),
+            str(source),
+            "wing_daphne",
+            router=FakeRouter(),
+            dry_run=False,
+            expected_plan_sha256="sha256:" + "0" * 64,
+            allowed_source_roots=[str(source)],
+        )
 
 
 def test_project_miner_routes_drawer_chunks_and_builds_room_scoped_closets(tmp_path):
@@ -330,4 +372,5 @@ def test_operator_refile_tool_is_registered_as_dry_run_by_default():
 
     assert tool["handler"] is mcp_server.tool_subject_refile
     assert tool["input_schema"]["required"] == ["source", "wing"]
+    assert "expected_plan_sha256" in tool["input_schema"]["properties"]
     assert "mempalace_subject_refile" in mcp_server._MUTATING_TOOLS
