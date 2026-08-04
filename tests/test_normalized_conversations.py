@@ -18,6 +18,7 @@ def _write_pair(
     room="communication",
     authored_from="2026-07-29T23:55:00Z",
     authored_to="2026-07-30T00:05:00Z",
+    schema="mempalace-normalized-conversation/v1",
 ):
     transcript_path = tmp_path / "session.md"
     transcript_text = transcript or (
@@ -29,7 +30,7 @@ def _write_pair(
     )
     transcript_path.write_text(transcript_text)
     sidecar = {
-        "schema": "mempalace-normalized-conversation/v1",
+        "schema": schema,
         "room": room,
         "authored_from": authored_from,
         "authored_to": authored_to,
@@ -43,6 +44,205 @@ def _write_pair(
     sidecar_path = tmp_path / "session.md.meta.json"
     sidecar_path.write_text(json.dumps(sidecar))
     return transcript_path, sidecar_path, transcript_text, sidecar
+
+
+def _discord_v2_transcript(*, origin=None, person=None):
+    user = {
+        "id": "41",
+        "role": "user",
+        "timestamp": "2026-07-29T23:55:00Z",
+    }
+    if origin is not None:
+        user["origin"] = origin
+    if person is not None:
+        user["person"] = person
+    envelope = {
+        "messages": [
+            user,
+            {
+                "id": "42",
+                "role": "assistant",
+                "timestamp": "2026-07-29T23:56:00Z",
+            },
+        ]
+    }
+    return (
+        f"<!-- mempalace-exchange {json.dumps(envelope, separators=(',', ':'))} -->\n"
+        "> exact Discord user text\n"
+        "Exact assistant text.\n"
+    )
+
+
+def test_v2_accepts_closed_discord_origin_and_resolved_person_identity(tmp_path):
+    normalized = _module()
+    origin = {
+        "platform": "discord",
+        "guild_id": "100000000000000001",
+        "channel_id": "100000000000000002",
+        "thread_id": "100000000000000003",
+        "message_id": "100000000000000004",
+        "chat_type": "guild_thread",
+        "profile": "amber-discord",
+    }
+    person = {
+        "person_id": "person_jonathan",
+        "discord_user_id": "100000000000000005",
+        "display_name": "Jonathan",
+        "status": "resolved",
+    }
+    transcript = _discord_v2_transcript(origin=origin, person=person)
+    transcript_path, _, _, _ = _write_pair(
+        tmp_path,
+        transcript=transcript,
+        schema="mempalace-normalized-conversation/v2",
+    )
+
+    conversation = normalized.load_normalized_conversation(
+        transcript_path, tmp_path, extract_mode="exchange"
+    )
+    chunks = normalized.chunk_normalized_conversation(conversation, chunk_size=800)
+
+    assert chunks == [
+        {
+            "content": transcript,
+            "chunk_index": 0,
+            "authored_from": "2026-07-29T23:55:00Z",
+            "authored_to": "2026-07-29T23:56:00Z",
+            "message_from": "41",
+            "message_to": "42",
+            "message_ids": "41;42",
+            "message_count": 2,
+            "origin_platform": "discord",
+            "discord_guild_id": "100000000000000001",
+            "discord_channel_id": "100000000000000002",
+            "discord_thread_id": "100000000000000003",
+            "discord_message_id": "100000000000000004",
+            "discord_chat_type": "guild_thread",
+            "discord_profile": "amber-discord",
+            "person_id": "person_jonathan",
+            "person_discord_user_id": "100000000000000005",
+            "person_display_name": "Jonathan",
+            "person_identity_status": "resolved",
+        }
+    ]
+
+
+def test_v2_allows_explicit_unknown_person_without_inventing_person_id(tmp_path):
+    normalized = _module()
+    transcript = _discord_v2_transcript(
+        origin={
+            "platform": "discord",
+            "channel_id": "100000000000000002",
+            "message_id": "100000000000000004",
+        },
+        person={
+            "discord_user_id": "100000000000000005",
+            "display_name": "Deleted User",
+            "status": "unknown",
+        },
+    )
+    transcript_path, _, _, _ = _write_pair(
+        tmp_path,
+        transcript=transcript,
+        schema="mempalace-normalized-conversation/v2",
+    )
+
+    conversation = normalized.load_normalized_conversation(
+        transcript_path, tmp_path, extract_mode="exchange"
+    )
+    chunk = normalized.chunk_normalized_conversation(conversation, chunk_size=800)[0]
+
+    assert "person_id" not in chunk
+    assert chunk["person_identity_status"] == "unknown"
+    assert chunk["person_discord_user_id"] == "100000000000000005"
+
+
+@pytest.mark.parametrize(
+    ("mutate", "match"),
+    [
+        (lambda user: user["origin"].update(raw={"nested": True}), "origin.*fields"),
+        (lambda user: user["origin"].update(platform="telegram"), "platform.*discord"),
+        (lambda user: user["origin"].update(channel_id="not-a-snowflake"), "channel_id"),
+        (lambda user: user["person"].update(person_id="Jonathan"), "person_id"),
+        (lambda user: user["person"].update(status="guessed"), "status"),
+        (lambda user: user["person"].update(extra="leak"), "person.*fields"),
+    ],
+)
+def test_v2_discord_origin_and_person_are_closed_and_validated(tmp_path, mutate, match):
+    normalized = _module()
+    user = {
+        "id": "41",
+        "role": "user",
+        "timestamp": "2026-07-29T23:55:00Z",
+        "origin": {
+            "platform": "discord",
+            "channel_id": "100000000000000002",
+            "message_id": "100000000000000004",
+        },
+        "person": {
+            "person_id": "person_jonathan",
+            "discord_user_id": "100000000000000005",
+            "display_name": "Jonathan",
+            "status": "resolved",
+        },
+    }
+    mutate(user)
+    transcript = _discord_v2_transcript(origin=user["origin"], person=user["person"])
+    transcript_path, _, _, _ = _write_pair(
+        tmp_path,
+        transcript=transcript,
+        schema="mempalace-normalized-conversation/v2",
+    )
+
+    with pytest.raises(normalized.NormalizedConversationError, match=match):
+        normalized.load_normalized_conversation(transcript_path, tmp_path, extract_mode="exchange")
+
+
+@pytest.mark.parametrize("field", ["origin", "person"])
+def test_v2_origin_and_person_are_user_message_only(tmp_path, field):
+    normalized = _module()
+    transcript = _discord_v2_transcript()
+    envelope_line, body = transcript.split("\n", 1)
+    envelope = json.loads(envelope_line[len("<!-- mempalace-exchange ") : -4])
+    envelope["messages"][1][field] = (
+        {
+            "platform": "discord",
+            "channel_id": "100000000000000002",
+            "message_id": "100000000000000004",
+        }
+        if field == "origin"
+        else {
+            "discord_user_id": "100000000000000005",
+            "display_name": "Jonathan",
+            "status": "unknown",
+        }
+    )
+    transcript = (
+        f"<!-- mempalace-exchange {json.dumps(envelope, separators=(',', ':'))} -->\n{body}"
+    )
+    transcript_path, _, _, _ = _write_pair(
+        tmp_path,
+        transcript=transcript,
+        schema="mempalace-normalized-conversation/v2",
+    )
+
+    with pytest.raises(normalized.NormalizedConversationError, match="user message"):
+        normalized.load_normalized_conversation(transcript_path, tmp_path, extract_mode="exchange")
+
+
+def test_v1_rejects_v2_message_fields_and_preserves_existing_contract(tmp_path):
+    normalized = _module()
+    transcript = _discord_v2_transcript(
+        origin={
+            "platform": "discord",
+            "channel_id": "100000000000000002",
+            "message_id": "100000000000000004",
+        }
+    )
+    transcript_path, _, _, _ = _write_pair(tmp_path, transcript=transcript)
+
+    with pytest.raises(normalized.NormalizedConversationError, match="provenance.*fields"):
+        normalized.load_normalized_conversation(transcript_path, tmp_path, extract_mode="exchange")
 
 
 def test_one_exchange_preserves_exact_transformed_text_without_normalization(tmp_path):
@@ -368,6 +568,82 @@ def test_miner_stamps_normalized_room_chronology_and_source_version(tmp_path):
     assert metadata["message_to"] == "42"
     assert metadata["source_version"].startswith("sha256:")
     assert metadata["source_chunk_count"] == 1
+
+
+def test_miner_flattens_only_validated_v2_discord_and_person_fields(tmp_path, capsys):
+    import chromadb
+
+    from mempalace.convo_miner import mine_convos
+
+    source = tmp_path / "source"
+    source.mkdir()
+    transcript = _discord_v2_transcript(
+        origin={
+            "platform": "discord",
+            "guild_id": "100000000000000001",
+            "channel_id": "100000000000000002",
+            "thread_id": "100000000000000003",
+            "message_id": "100000000000000004",
+            "chat_type": "guild_thread",
+            "profile": "amber-discord",
+        },
+        person={
+            "person_id": "person_jonathan",
+            "discord_user_id": "100000000000000005",
+            "display_name": "Jonathan",
+            "status": "resolved",
+        },
+    )
+    transcript_path, _, _, _ = _write_pair(
+        source,
+        transcript=transcript,
+        schema="mempalace-normalized-conversation/v2",
+    )
+    palace = tmp_path / "palace"
+
+    mine_convos(str(source), str(palace), wing="wing_amber_discord")
+
+    collection = chromadb.PersistentClient(path=str(palace)).get_collection("mempalace_drawers")
+    rows = collection.get(
+        where={"source_file": str(transcript_path.resolve())},
+        include=["metadatas"],
+    )
+    assert len(rows["ids"]) == 1
+    metadata = rows["metadatas"][0]
+    assert {
+        key: metadata[key]
+        for key in (
+            "origin_platform",
+            "discord_guild_id",
+            "discord_channel_id",
+            "discord_thread_id",
+            "discord_message_id",
+            "discord_chat_type",
+            "discord_profile",
+            "person_id",
+            "person_discord_user_id",
+            "person_display_name",
+            "person_identity_status",
+        )
+    } == {
+        "origin_platform": "discord",
+        "discord_guild_id": "100000000000000001",
+        "discord_channel_id": "100000000000000002",
+        "discord_thread_id": "100000000000000003",
+        "discord_message_id": "100000000000000004",
+        "discord_chat_type": "guild_thread",
+        "discord_profile": "amber-discord",
+        "person_id": "person_jonathan",
+        "person_discord_user_id": "100000000000000005",
+        "person_display_name": "Jonathan",
+        "person_identity_status": "resolved",
+    }
+    assert "origin" not in metadata
+    assert "person" not in metadata
+
+    capsys.readouterr()
+    mine_convos(str(source), str(palace), wing="wing_amber_discord")
+    assert "Files skipped (already filed): 1" in capsys.readouterr().out
 
 
 def test_subject_routing_files_each_exchange_into_its_stable_subject(tmp_path, monkeypatch):

@@ -42,6 +42,38 @@ keeps every transcript character verbatim, including line endings and
 assistant Markdown blockquotes. It stamps the ordered identifiers and the
 minimum and maximum message timestamps on each resulting drawer.
 
+## Discord origin and person identity (v2)
+
+Schema v2 adds optional, user-message-only `origin` and `person` objects to
+the exchange envelope. The transcript body remains verbatim. A complete
+resolved example is:
+
+```markdown
+<!-- mempalace-exchange {"messages":[{"id":"41","role":"user","timestamp":"2026-07-29T23:55:00Z","origin":{"platform":"discord","guild_id":"100000000000000001","channel_id":"100000000000000002","thread_id":"100000000000000003","message_id":"100000000000000004","chat_type":"guild_thread","profile":"amber-discord"},"person":{"person_id":"person_jonathan","discord_user_id":"100000000000000005","display_name":"Jonathan","status":"resolved"}},{"id":"42","role":"assistant","timestamp":"2026-07-29T23:56:00Z"}]} -->
+> exact transformed Discord user text
+Exact transformed assistant text.
+```
+
+Set the adjacent sidecar's `schema` to
+`mempalace-normalized-conversation/v2`. Both nested objects are closed:
+
+- `origin` requires `platform: "discord"`, `channel_id`, and `message_id`.
+  It may also carry `guild_id`, `thread_id`, `chat_type`, and `profile`.
+- `person` requires `discord_user_id`, `display_name`, and `status`. Status is
+  `resolved`, `unknown`, or `quarantined`. A resolved person requires a stable
+  `person_<alias>` `person_id`; unknown and quarantined identities must not
+  claim one.
+
+Discord IDs are bounded decimal strings. Chat type and profile are bounded
+safe slugs. Arbitrary or additional nested fields fail validation. MemPalace
+copies only the validated scalar fields to flat drawer metadata under
+`origin_platform`, `discord_*`, `person_id`, and `person_*` keys. It never
+stores either nested object or passes undeclared nested data to Chroma.
+
+V1 remains the default `SCHEMA` constant and retains its exact message shape.
+An envelope using v1 rejects `origin` and `person`, so existing exporters and
+source-version calculations remain compatible.
+
 Mine normalized exports only in exchange mode:
 
 ```bash
