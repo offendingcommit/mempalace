@@ -19,12 +19,30 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-SCHEMA = "mempalace-normalized-conversation/v1"
+SCHEMA_V1 = "mempalace-normalized-conversation/v1"
+SCHEMA_V2 = "mempalace-normalized-conversation/v2"
+# Keep the original public name pinned to v1. Existing exporters and callers
+# import ``SCHEMA`` when writing the byte-compatible v1 contract.
+SCHEMA = SCHEMA_V1
+SUPPORTED_SCHEMAS = frozenset({SCHEMA_V1, SCHEMA_V2})
 SIDECAR_SUFFIX = ".meta.json"
 MAX_SIDECAR_BYTES = 64 * 1024
 MAX_TRANSCRIPT_BYTES = 128 * 1024 * 1024
 MAX_ENVELOPE_BYTES = 16 * 1024
 MAX_MESSAGES_PER_EXCHANGE = 64
+PROVENANCE_METADATA_FIELDS = (
+    "origin_platform",
+    "discord_guild_id",
+    "discord_channel_id",
+    "discord_thread_id",
+    "discord_message_id",
+    "discord_chat_type",
+    "discord_profile",
+    "person_id",
+    "person_discord_user_id",
+    "person_display_name",
+    "person_identity_status",
+)
 
 _SIDECAR_FIELDS = {
     "schema",
@@ -54,6 +72,21 @@ _SLUG_RE = re.compile(r"^[a-z0-9]+(?:[-_.][a-z0-9]+)*$")
 _VERSION_RE = re.compile(r"^[0-9]+(?:\.[0-9]+){1,3}(?:[-+][A-Za-z0-9.-]+)?$")
 _FINGERPRINT_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _TRANSFORMATIONS_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*(?:;[a-z0-9]+(?:-[a-z0-9]+)*)*$")
+_DISCORD_ID_RE = re.compile(r"^[0-9]{1,32}$")
+_PERSON_ID_RE = re.compile(r"^person_[a-z0-9]+(?:_[a-z0-9]+)*$")
+_DISCORD_ORIGIN_FIELDS = {
+    "platform",
+    "guild_id",
+    "channel_id",
+    "thread_id",
+    "message_id",
+    "chat_type",
+    "profile",
+}
+_DISCORD_ORIGIN_REQUIRED_FIELDS = {"platform", "channel_id", "message_id"}
+_PERSON_FIELDS = {"person_id", "discord_user_id", "display_name", "status"}
+_PERSON_REQUIRED_FIELDS = {"discord_user_id", "display_name", "status"}
+_PERSON_STATUSES = {"resolved", "unknown", "quarantined"}
 _EXCHANGE_PREFIX = "<!-- mempalace-exchange "
 _COVERAGE_SCHEMA = "mempalace-applied-coverage/v1"
 _COVERAGE_FILENAME = "normalized-conversation-coverage.json"
@@ -125,6 +158,17 @@ class NormalizedExchange:
     message_to: str
     message_ids: str
     message_count: int
+    origin_platform: str | None = None
+    discord_guild_id: str | None = None
+    discord_channel_id: str | None = None
+    discord_thread_id: str | None = None
+    discord_message_id: str | None = None
+    discord_chat_type: str | None = None
+    discord_profile: str | None = None
+    person_id: str | None = None
+    person_discord_user_id: str | None = None
+    person_display_name: str | None = None
+    person_identity_status: str | None = None
 
 
 @dataclass(frozen=True)
@@ -237,7 +281,7 @@ def _load_sidecar(sidecar_path: Path, root: Path) -> NormalizedMetadata:
         )
     if any(not isinstance(value, str) for value in payload.values()):
         raise NormalizedConversationError("sidecar fields must all be flat strings")
-    if payload["schema"] != SCHEMA:
+    if payload["schema"] not in SUPPORTED_SCHEMAS:
         raise NormalizedConversationError("unsupported normalized conversation schema")
 
     room = payload["room"]
@@ -267,7 +311,64 @@ def _load_sidecar(sidecar_path: Path, root: Path) -> NormalizedMetadata:
     return NormalizedMetadata(**payload)
 
 
-def _validate_messages(payload: Any) -> tuple[list[dict[str, str]], list[datetime]]:
+def _validate_discord_origin(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise NormalizedConversationError("Discord origin must be an object")
+    fields = set(value)
+    if not _DISCORD_ORIGIN_REQUIRED_FIELDS <= fields or not fields <= _DISCORD_ORIGIN_FIELDS:
+        raise NormalizedConversationError("Discord origin fields are invalid")
+    if value.get("platform") != "discord":
+        raise NormalizedConversationError("origin platform must be discord")
+    for field in ("guild_id", "channel_id", "thread_id", "message_id"):
+        if field in value and (
+            not isinstance(value[field], str) or not _DISCORD_ID_RE.fullmatch(value[field])
+        ):
+            raise NormalizedConversationError(f"origin {field} must be a Discord ID string")
+    for field in ("chat_type", "profile"):
+        if field in value and (
+            not isinstance(value[field], str)
+            or len(value[field]) > 64
+            or not _SLUG_RE.fullmatch(value[field])
+        ):
+            raise NormalizedConversationError(f"origin {field} must be a bounded safe slug")
+    return dict(value)
+
+
+def _validate_person(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise NormalizedConversationError("person identity must be an object")
+    fields = set(value)
+    if not _PERSON_REQUIRED_FIELDS <= fields or not fields <= _PERSON_FIELDS:
+        raise NormalizedConversationError("person identity fields are invalid")
+    discord_user_id = value.get("discord_user_id")
+    if not isinstance(discord_user_id, str) or not _DISCORD_ID_RE.fullmatch(discord_user_id):
+        raise NormalizedConversationError("person discord_user_id must be a Discord ID string")
+    display_name = value.get("display_name")
+    if (
+        not isinstance(display_name, str)
+        or not display_name
+        or len(display_name) > 256
+        or any(ord(char) < 32 for char in display_name)
+    ):
+        raise NormalizedConversationError("person display_name must be a bounded display string")
+    status = value.get("status")
+    if status not in _PERSON_STATUSES:
+        raise NormalizedConversationError("person status must be resolved, unknown, or quarantined")
+    person_id = value.get("person_id")
+    if person_id is not None and (
+        not isinstance(person_id, str)
+        or len(person_id) > 128
+        or not _PERSON_ID_RE.fullmatch(person_id)
+    ):
+        raise NormalizedConversationError("person_id must be a person_<alias> key")
+    if status == "resolved" and person_id is None:
+        raise NormalizedConversationError("resolved person identity requires person_id")
+    if status != "resolved" and person_id is not None:
+        raise NormalizedConversationError("unresolved person identity must not claim person_id")
+    return dict(value)
+
+
+def _validate_messages(payload: Any, schema: str) -> tuple[list[dict[str, Any]], list[datetime]]:
     if not isinstance(payload, dict) or set(payload) != {"messages"}:
         raise NormalizedConversationError("exchange envelope must contain only messages")
     messages = payload["messages"]
@@ -278,9 +379,13 @@ def _validate_messages(payload: Any) -> tuple[list[dict[str, str]], list[datetim
     timestamps: list[datetime] = []
     identifiers: set[str] = set()
     for index, message in enumerate(messages):
-        if not isinstance(message, dict) or set(message) != {"id", "role", "timestamp"}:
+        if not isinstance(message, dict):
             raise NormalizedConversationError("each message provenance entry has invalid fields")
-        if any(not isinstance(value, str) or not value for value in message.values()):
+        base_fields = {"id", "role", "timestamp"}
+        allowed_fields = base_fields if schema == SCHEMA_V1 else base_fields | {"origin", "person"}
+        if not base_fields <= set(message) or not set(message) <= allowed_fields:
+            raise NormalizedConversationError("each message provenance entry has invalid fields")
+        if any(not isinstance(message[field], str) or not message[field] for field in base_fields):
             raise NormalizedConversationError("message provenance values must be strings")
         identifier = message["id"]
         if (
@@ -299,11 +404,19 @@ def _validate_messages(payload: Any) -> tuple[list[dict[str, str]], list[datetim
             raise NormalizedConversationError("first message in an exchange must be user")
         if index > 0 and role != "assistant":
             raise NormalizedConversationError("only the first exchange message may be user")
+        if index > 0 and ("origin" in message or "person" in message):
+            raise NormalizedConversationError(
+                "Discord origin and person identity are allowed only on the user message"
+            )
+        if "origin" in message:
+            message["origin"] = _validate_discord_origin(message["origin"])
+        if "person" in message:
+            message["person"] = _validate_person(message["person"])
         timestamps.append(_parse_iso(message["timestamp"], "message timestamp"))
     return list(messages), timestamps
 
 
-def _parse_exchanges(transcript: str) -> tuple[NormalizedExchange, ...]:
+def _parse_exchanges(transcript: str, schema: str) -> tuple[NormalizedExchange, ...]:
     starts = [match.start() for match in re.finditer(r"(?m)^<!-- mempalace-exchange ", transcript)]
     if not starts or starts[0] != 0:
         raise NormalizedConversationError("transcript must begin with an exchange envelope")
@@ -323,7 +436,7 @@ def _parse_exchanges(transcript: str) -> tuple[NormalizedExchange, ...]:
             envelope = json.loads(envelope_line[len(_EXCHANGE_PREFIX) : -4])
         except json.JSONDecodeError as exc:
             raise NormalizedConversationError("exchange envelope JSON is invalid") from exc
-        messages, timestamps = _validate_messages(envelope)
+        messages, timestamps = _validate_messages(envelope, schema)
         exchange_message_ids = {message["id"] for message in messages}
         if transcript_message_ids & exchange_message_ids:
             raise NormalizedConversationError("message ids must be unique across the transcript")
@@ -354,6 +467,9 @@ def _parse_exchanges(transcript: str) -> tuple[NormalizedExchange, ...]:
                 authored_to = message["timestamp"]
                 break
         message_ids = [message["id"] for message in messages]
+        user_message = messages[0]
+        origin = user_message.get("origin", {})
+        person = user_message.get("person", {})
         exchanges.append(
             NormalizedExchange(
                 start=start,
@@ -364,6 +480,17 @@ def _parse_exchanges(transcript: str) -> tuple[NormalizedExchange, ...]:
                 message_to=message_ids[-1],
                 message_ids=";".join(message_ids),
                 message_count=len(message_ids),
+                origin_platform=origin.get("platform"),
+                discord_guild_id=origin.get("guild_id"),
+                discord_channel_id=origin.get("channel_id"),
+                discord_thread_id=origin.get("thread_id"),
+                discord_message_id=origin.get("message_id"),
+                discord_chat_type=origin.get("chat_type"),
+                discord_profile=origin.get("profile"),
+                person_id=person.get("person_id"),
+                person_discord_user_id=person.get("discord_user_id"),
+                person_display_name=person.get("display_name"),
+                person_identity_status=person.get("status"),
             )
         )
     return tuple(exchanges)
@@ -435,7 +562,7 @@ def load_normalized_conversation(
     except UnicodeDecodeError as exc:
         raise NormalizedConversationError("transcript must be valid UTF-8") from exc
     sidecar = _load_sidecar(sidecar_path, source_root)
-    exchanges = _parse_exchanges(transcript)
+    exchanges = _parse_exchanges(transcript, sidecar.schema)
 
     exchange_from = min(
         _parse_iso(item.authored_from, "exchange authored_from") for item in exchanges
@@ -465,8 +592,13 @@ def iter_normalized_conversation_chunks(
         raise ValueError("chunk_size must be a positive integer")
     chunk_index = 0
     for exchange in conversation.exchanges:
+        exchange_metadata = {}
+        for field in PROVENANCE_METADATA_FIELDS:
+            value = getattr(exchange, field)
+            if value is not None:
+                exchange_metadata[field] = value
         for offset in range(exchange.start, exchange.stop, chunk_size):
-            yield {
+            chunk = {
                 "content": conversation.transcript[
                     offset : min(offset + chunk_size, exchange.stop)
                 ],
@@ -478,6 +610,8 @@ def iter_normalized_conversation_chunks(
                 "message_ids": exchange.message_ids,
                 "message_count": exchange.message_count,
             }
+            chunk.update(exchange_metadata)
+            yield chunk
             chunk_index += 1
 
 

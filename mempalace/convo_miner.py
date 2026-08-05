@@ -27,7 +27,8 @@ from .collision_scan import assert_no_collisions
 from .ids import ID_RECIPE, make_convo_drawer_id, make_convo_sentinel_id
 from .normalize import normalize
 from .normalized_conversations import (
-    SCHEMA as NORMALIZED_CONVERSATION_SCHEMA,
+    PROVENANCE_METADATA_FIELDS,
+    SUPPORTED_SCHEMAS as NORMALIZED_CONVERSATION_SCHEMAS,
     NormalizedConversation,
     NormalizedConversationProbe,
     count_normalized_conversation_chunks,
@@ -314,7 +315,7 @@ def _prefetch_normalized_sources(
         batch = collection.get(
             where={
                 "$and": [
-                    {"normalized_schema": NORMALIZED_CONVERSATION_SCHEMA},
+                    {"normalized_schema": {"$in": sorted(NORMALIZED_CONVERSATION_SCHEMAS)}},
                     {"wing": wing},
                 ]
             },
@@ -357,10 +358,12 @@ def normalized_conversation_delta(
     db_path = Path(palace_path) / "chroma.sqlite3"
     if not db_path.is_file():
         raise ValueError("read-only delta reporting currently requires an existing Chroma palace")
+    schemas = tuple(sorted(NORMALIZED_CONVERSATION_SCHEMAS))
+    schema_placeholders = ", ".join("?" for _ in schemas)
     connection = sqlite3.connect(sqlite_read_uri(str(db_path)), uri=True)
     try:
         rows = connection.execute(
-            """
+            f"""
             SELECT sf.string_value,
                    COALESCE(sg.string_value, sv.string_value),
                    scs.int_value,
@@ -396,12 +399,16 @@ def normalized_conversation_delta(
                 ON em.id = e.id AND em.key = 'extract_mode'
              WHERE c.name = ?
                AND w.string_value = ?
-               AND ns.string_value = ?
+               AND ns.string_value IN ({schema_placeholders})
              GROUP BY sf.string_value, sg.string_value, sv.string_value, scs.int_value,
                       nv.int_value, ir.string_value, scc.int_value,
                       em.string_value
             """,
-            (palace_config.collection_name, wing, NORMALIZED_CONVERSATION_SCHEMA),
+            (
+                palace_config.collection_name,
+                wing,
+                *schemas,
+            ),
         )
         for (
             source_file,
@@ -965,6 +972,14 @@ def _file_chunks_locked(
                             "normalized_schema": normalized.metadata.schema,
                         }
                     )
+                    # v2 carries a closed, validated Discord/person contract
+                    # on the exchange's user message. Copy only these named
+                    # scalar fields into Chroma; nested source data never
+                    # reaches drawer metadata.
+                    for field in PROVENANCE_METADATA_FIELDS:
+                        value = chunk.get(field)
+                        if value is not None:
+                            meta[field] = value
                     if subject_policy:
                         meta.update(
                             {
