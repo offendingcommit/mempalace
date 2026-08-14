@@ -126,7 +126,7 @@ multilingual = []
 # Binary-format extraction for `mempalace mine --mode extract`. Per-format
 # transformer routing: striprtf for .rtf, MarkItDown for .pdf/.docx/.pptx/
 # .xlsx/.epub. MarkItDown requires Python ≥ 3.10 (env marker ensures it
-# only installs where supported; Python 3.9 users still get RTF coverage).
+# only installs where supported; other platforms still get RTF coverage).
 extract = [
     "striprtf>=0.0.27",
     # Per PR #1555 review (Igor): bare ``markitdown`` is enough to import
