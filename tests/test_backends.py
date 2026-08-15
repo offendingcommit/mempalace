@@ -1923,6 +1923,29 @@ def test_chroma_backend_resets_system_cache_on_inode_change(tmp_path, monkeypatc
     ], events
 
 
+def test_chroma_backend_does_not_treat_its_own_write_as_external(tmp_path):
+    """A local write refreshes the cached DB signature.
+
+    Otherwise the next operation closes the client that backs every live
+    collection wrapper, producing ``RustBindingsAPI has no bindings`` while
+    ordinary mine and re-mine flows are still using those wrappers.
+    """
+    palace = tmp_path / "palace"
+    backend = ChromaBackend()
+    reference = PalaceRef(id=str(palace), local_path=str(palace))
+    collection = backend.get_collection(
+        palace=reference,
+        collection_name="mempalace_drawers",
+        create=True,
+    )
+    cached = backend._clients[str(palace)]
+
+    collection.upsert(ids=["one"], documents=["one"], metadatas=[{"wing": "test"}])
+
+    assert backend._client(str(palace)) is cached
+    assert collection.count() == 1
+
+
 def test_explain_ef_mismatch_recognizes_chromadb_conflict():
     """When ChromaDB rejects a collection read due to an EF-name mismatch
     (user changed MEMPALACE_EMBEDDING_MODEL on an existing palace), the

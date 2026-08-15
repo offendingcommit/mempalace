@@ -1595,9 +1595,14 @@ class ChromaCollection(BaseCollection):
     directly without going through ``ChromaBackend``.
     """
 
-    def __init__(self, collection, palace_path: Optional[str] = None):
+    def __init__(self, collection, palace_path: Optional[str] = None, after_write=None):
         self._collection = collection
         self._palace_path = palace_path
+        self._after_write = after_write
+
+    def _record_write(self) -> None:
+        if self._after_write is not None:
+            self._after_write()
 
     @contextlib.contextmanager
     def _write_lock(self):
@@ -1689,6 +1694,7 @@ class ChromaCollection(BaseCollection):
             kwargs["embeddings"] = embeddings
         with self._write_lock():
             self._collection.add(**kwargs)
+            self._record_write()
 
     def upsert(self, *, documents, ids, metadatas=None, embeddings=None):
         kwargs: dict[str, Any] = {
@@ -1702,6 +1708,7 @@ class ChromaCollection(BaseCollection):
             kwargs["embeddings"] = embeddings
         with self._write_lock():
             self._collection.upsert(**kwargs)
+            self._record_write()
 
     def update(
         self,
@@ -1722,6 +1729,7 @@ class ChromaCollection(BaseCollection):
             kwargs["embeddings"] = embeddings
         with self._write_lock():
             self._collection.update(**kwargs)
+            self._record_write()
 
     # ------------------------------------------------------------------
     # Reads
@@ -1867,6 +1875,7 @@ class ChromaCollection(BaseCollection):
             kwargs["where"] = where
         with self._write_lock():
             self._collection.delete(**kwargs)
+            self._record_write()
 
     def count(self):
         return self._collection.count()
@@ -2481,7 +2490,16 @@ class ChromaBackend(BaseBackend):
                     raise ValueError(explanation) from e
                 raise
         _pin_hnsw_threads(collection)
-        return ChromaCollection(collection, palace_path=palace_path)
+        # Collection creation and migration can write chroma.sqlite3 before
+        # the returned wrapper has a chance to run its after-write callback.
+        self._freshness[palace_path] = self._db_stat(palace_path)
+        return ChromaCollection(
+            collection,
+            palace_path=palace_path,
+            after_write=lambda: self._freshness.__setitem__(
+                palace_path, self._db_stat(palace_path)
+            ),
+        )
 
     def close_palace(self, palace) -> None:
         """Drop cached handles for ``palace`` and release its SQLite file lock.
@@ -2555,7 +2573,13 @@ class ChromaBackend(BaseBackend):
             metadata=_hnsw_creation_metadata({"hnsw_space": hnsw_space}),
             **ef_kwargs,
         )
-        return ChromaCollection(collection, palace_path=palace_path)
+        return ChromaCollection(
+            collection,
+            palace_path=palace_path,
+            after_write=lambda: self._freshness.__setitem__(
+                palace_path, self._db_stat(palace_path)
+            ),
+        )
 
 
 def _normalize_get_collection_args(args, kwargs):

@@ -46,6 +46,7 @@ from .palace import (
 from .collision_scan import assert_no_collisions
 from .hallways import compute_hallways_for_wing
 from .ids import ID_RECIPE, make_drawer_id_from_chunk
+from .subject_router import SubjectRouter
 
 logger = logging.getLogger("mempalace_mcp")
 
@@ -1400,6 +1401,7 @@ def _build_drawer_metadata(
     line_end: Optional[int] = None,
     content_date: Optional[str] = None,
     chunk_total: Optional[int] = None,
+    source_root: Optional[str] = None,
 ) -> dict:
     """Build the metadata dict for one drawer without upserting.
 
@@ -1433,7 +1435,10 @@ def _build_drawer_metadata(
         "filed_at": datetime.now().isoformat(),
         "normalize_version": NORMALIZE_VERSION,
         "id_recipe": ID_RECIPE,
+        "ingest_mode": "projects",
     }
+    if source_root is not None:
+        metadata["source_root"] = source_root
     if source_mtime is not None:
         metadata["source_mtime"] = source_mtime
     if line_start is not None:
@@ -1481,6 +1486,21 @@ def add_drawer(
 # =============================================================================
 
 
+def _route_project_chunks(chunks: list[dict], subject_router: SubjectRouter) -> dict[str, int]:
+    routed_counts: dict[str, int] = defaultdict(int)
+    for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
+        batch = chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
+        routes = subject_router.route_many([chunk["content"] for chunk in batch])
+        if len(routes) != len(batch):
+            raise RuntimeError("subject router did not classify every project chunk")
+        for chunk, route in zip(batch, routes):
+            chunk["room"] = route.room
+            chunk["subject_route"] = route.method
+            chunk["subject_score"] = route.score
+            routed_counts[route.room] += 1
+    return routed_counts
+
+
 def process_file(
     filepath: Path,
     project_path: Path,
@@ -1494,6 +1514,7 @@ def process_file(
     chunk_overlap: int = None,
     min_chunk_size: int = None,
     max_chunks_per_file: Optional[int] = None,
+    subject_router: Optional[SubjectRouter] = None,
 ) -> tuple:
     """Read, chunk, route, and file one file.
 
@@ -1544,8 +1565,22 @@ def process_file(
         )
         return 0, room, "chunk_cap"
 
+    routed_counts = defaultdict(int)
+    if subject_router is not None:
+        routed_counts = _route_project_chunks(chunks, subject_router)
+        room = max(routed_counts, key=routed_counts.get)
+
     if dry_run:
-        print(f"    [DRY RUN] {filepath.name} -> room:{room} ({len(chunks)} drawers)")
+        if subject_router is not None:
+            rooms_text = ", ".join(
+                f"{name}:{count}"
+                for name, count in sorted(
+                    routed_counts.items(), key=lambda item: (-item[1], item[0])
+                )
+            )
+            print(f"    [DRY RUN] {filepath.name} -> {len(chunks)} drawers ({rooms_text})")
+        else:
+            print(f"    [DRY RUN] {filepath.name} -> room:{room} ({len(chunks)} drawers)")
         return len(chunks), room, None
 
     # Lock this file so concurrent agents don't interleave delete+insert.
@@ -1609,26 +1644,35 @@ def process_file(
                 batch_ids: list = []
                 batch_metas: list = []
                 for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
+                    chunk_room = chunk.get("room", room)
                     drawer_id = make_drawer_id_from_chunk(
-                        wing, room, source_file, chunk["chunk_index"]
+                        wing, chunk_room, source_file, chunk["chunk_index"]
                     )
                     batch_docs.append(chunk["content"])
                     batch_ids.append(drawer_id)
-                    batch_metas.append(
-                        _build_drawer_metadata(
-                            wing,
-                            room,
-                            source_file,
-                            chunk["chunk_index"],
-                            agent,
-                            chunk["content"],
-                            source_mtime,
-                            line_start=chunk.get("line_start"),
-                            line_end=chunk.get("line_end"),
-                            content_date=file_content_date,
-                            chunk_total=len(chunks),
-                        )
+                    metadata = _build_drawer_metadata(
+                        wing,
+                        chunk_room,
+                        source_file,
+                        chunk["chunk_index"],
+                        agent,
+                        chunk["content"],
+                        source_mtime,
+                        line_start=chunk.get("line_start"),
+                        line_end=chunk.get("line_end"),
+                        content_date=file_content_date,
+                        chunk_total=len(chunks),
+                        source_root=str(project_path.resolve()),
                     )
+                    if subject_router is not None:
+                        metadata.update(
+                            {
+                                "subject_policy": subject_router.fingerprint,
+                                "subject_route": chunk["subject_route"],
+                                "subject_score": float(chunk["subject_score"]),
+                            }
+                        )
+                    batch_metas.append(metadata)
                 assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
                 collection.upsert(
                     documents=batch_docs,
@@ -1666,6 +1710,46 @@ def process_file(
         if closets_col:
             purge_file_closets(closets_col, source_file)
         if closets_col and drawers_added > 0:
+            if subject_router is not None:
+                room_chunks: dict[str, list[tuple[dict, dict]]] = defaultdict(list)
+                for chunk, metadata in zip(chunks, all_metas):
+                    room_chunks[metadata["room"]].append((chunk, metadata))
+                for closet_room, grouped in room_chunks.items():
+                    grouped_chunks = [item[0] for item in grouped]
+                    grouped_metas = [item[1] for item in grouped]
+                    drawer_ids = [
+                        make_drawer_id_from_chunk(
+                            wing, closet_room, source_file, chunk["chunk_index"]
+                        )
+                        for chunk in grouped_chunks
+                    ]
+                    room_content = "\n\n".join(chunk["content"] for chunk in grouped_chunks)
+                    closet_lines = build_closet_lines(
+                        source_file,
+                        drawer_ids,
+                        room_content,
+                        wing,
+                        closet_room,
+                        drawer_metas=grouped_metas,
+                    )
+                    closet_id_base = (
+                        f"closet_{wing}_{closet_room}_"
+                        f"{hashlib.sha256(source_file.encode()).hexdigest()[:24]}"
+                    )
+                    closet_meta = {
+                        "wing": wing,
+                        "room": closet_room,
+                        "source_file": source_file,
+                        "drawer_count": len(grouped_chunks),
+                        "filed_at": datetime.now().isoformat(),
+                        "normalize_version": NORMALIZE_VERSION,
+                        "subject_policy": subject_router.fingerprint,
+                    }
+                    entities = _extract_entities_for_metadata(room_content)
+                    if entities:
+                        closet_meta["entities"] = entities
+                    upsert_closet_lines(closets_col, closet_id_base, closet_lines, closet_meta)
+                return drawers_added, room, None
             drawer_ids = [
                 make_drawer_id_from_chunk(wing, room, source_file, c["chunk_index"]) for c in chunks
             ]
@@ -1844,6 +1928,7 @@ def mine(
     include_ignored: list = None,
     files: list = None,
     max_chunks_per_file: Optional[int] = None,
+    subject_routing: bool = False,
 ):
     """Mine a project directory into the palace.
 
@@ -1870,6 +1955,7 @@ def mine(
             include_ignored=include_ignored,
             files=files,
             max_chunks_per_file=max_chunks_per_file,
+            subject_routing=subject_routing,
         )
 
     # MineAlreadyRunning propagates so the CLI can render a clear holder-aware
@@ -1887,6 +1973,7 @@ def mine(
             include_ignored=include_ignored,
             files=files,
             max_chunks_per_file=max_chunks_per_file,
+            subject_routing=subject_routing,
         )
 
 
@@ -1901,12 +1988,14 @@ def _mine_impl(
     include_ignored: list = None,
     files: list = None,
     max_chunks_per_file: Optional[int] = None,
+    subject_routing: bool = False,
 ):
     from .config import MempalaceConfig
 
     project_path = Path(project_dir).expanduser().resolve()
     config = load_config(project_dir)
     palace_config = MempalaceConfig()
+    subject_router = SubjectRouter.from_env() if subject_routing else None
 
     cfg_chunk_size = palace_config.chunk_size
     cfg_chunk_overlap = palace_config.chunk_overlap
@@ -1983,6 +2072,7 @@ def _mine_impl(
                     # otherwise a malformed env var would emit its warning
                     # per file.
                     max_chunks_per_file=effective_chunk_cap,
+                    subject_router=subject_router,
                 )
             except KeyboardInterrupt:
                 # Re-raise so the outer handler prints the summary; we
