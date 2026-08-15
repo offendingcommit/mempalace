@@ -8381,14 +8381,19 @@ def _build_sdk_http_app(host: str, port: int):  # noqa: C901
                     _record_sdk_http_request(state, scope, headers, 401)
                     return
 
+            recorded = False
+
             async def record_send(message):
-                nonlocal status
+                nonlocal recorded, status
                 if message["type"] == "http.response.start":
                     status = message["status"]
+                    if scope["type"] == "http" and not recorded:
+                        _record_sdk_http_request(state, scope, headers, status)
+                        recorded = True
                 await send(message)
 
             await self.wrapped(scope, receive, record_send)
-            if scope["type"] == "http":
+            if scope["type"] == "http" and not recorded:
                 _record_sdk_http_request(state, scope, headers, status)
 
     return _BearerMiddleware(app), state
