@@ -1636,8 +1636,7 @@ def process_file(
                     drawer_metas=all_metas,
                 )
                 closet_id_base = (
-                    f"closet_{wing}_{room}_"
-                    f"{hashlib.sha256(source_file.encode()).hexdigest()[:24]}"
+                    f"closet_{wing}_{room}_{hashlib.sha256(source_file.encode()).hexdigest()[:24]}"
                 )
                 closet_meta = {
                     "wing": wing,

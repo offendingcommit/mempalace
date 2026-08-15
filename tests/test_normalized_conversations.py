@@ -450,31 +450,21 @@ def test_subject_policy_change_replaces_one_complete_normalized_generation(
             return [SubjectRoute(self.room, "semantic", 0.8) for _text in texts]
 
     active = {"router": PolicyRouter("sha256:" + "a" * 64, "music")}
-    monkeypatch.setattr(
-        convo_miner.SubjectRouter, "from_env", lambda: active["router"]
-    )
+    monkeypatch.setattr(convo_miner.SubjectRouter, "from_env", lambda: active["router"])
 
-    convo_miner.mine_convos(
-        str(source), str(palace), wing="wing_amber", subject_routing=True
-    )
+    convo_miner.mine_convos(str(source), str(palace), wing="wing_amber", subject_routing=True)
     capsys.readouterr()
-    collection = chromadb.PersistentClient(path=str(palace)).get_collection(
-        "mempalace_drawers"
-    )
+    collection = chromadb.PersistentClient(path=str(palace)).get_collection("mempalace_drawers")
     first = collection.get(
         where={"source_file": str(transcript_path.resolve())}, include=["metadatas"]
     )
     first_ids = set(first["ids"])
 
-    convo_miner.mine_convos(
-        str(source), str(palace), wing="wing_amber", subject_routing=True
-    )
+    convo_miner.mine_convos(str(source), str(palace), wing="wing_amber", subject_routing=True)
     assert "Files skipped (already filed): 1" in capsys.readouterr().out
 
     active["router"] = PolicyRouter("sha256:" + "b" * 64, "health")
-    convo_miner.mine_convos(
-        str(source), str(palace), wing="wing_amber", subject_routing=True
-    )
+    convo_miner.mine_convos(str(source), str(palace), wing="wing_amber", subject_routing=True)
     assert "Files skipped (already filed): 0" in capsys.readouterr().out
     second = collection.get(
         where={"source_file": str(transcript_path.resolve())}, include=["metadatas"]

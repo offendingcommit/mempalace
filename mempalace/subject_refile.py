@@ -198,9 +198,7 @@ def _apply_rows(collection, rows: list[dict[str, Any]], router: SubjectRouter) -
         collection.update(ids=[row["id"] for row in batch], metadatas=metadatas)
 
 
-def _purge_source_wing_rooms(
-    closets, source_file: str, wing: str, rooms: set[str]
-) -> None:
+def _purge_source_wing_rooms(closets, source_file: str, wing: str, rooms: set[str]) -> None:
     if not rooms:
         return
     result = closets.get(
@@ -428,9 +426,8 @@ def subject_refile(
         _route_rows(rows, router)
         report = _report(rows, router)
         if not dry_run:
-            if (
-                not isinstance(expected_plan_sha256, str)
-                or not re.fullmatch(r"sha256:[0-9a-f]{64}", expected_plan_sha256)
+            if not isinstance(expected_plan_sha256, str) or not re.fullmatch(
+                r"sha256:[0-9a-f]{64}", expected_plan_sha256
             ):
                 raise SubjectRefileError("apply requires an expected plan SHA-256")
             if report["plan_sha256"] != expected_plan_sha256:

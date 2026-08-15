@@ -178,9 +178,9 @@ class SubjectRouter:
             "policy": policy,
             "embedding_identity": embedding_identity,
         }
-        self.fingerprint = "sha256:" + hashlib.sha256(
-            _canonical_json(fingerprint_payload)
-        ).hexdigest()
+        self.fingerprint = (
+            "sha256:" + hashlib.sha256(_canonical_json(fingerprint_payload)).hexdigest()
+        )
         self._embedding_function = embedding_function
         self._semantic_rooms = semantic_rooms
         self._room_vectors = _normalized_rows(
