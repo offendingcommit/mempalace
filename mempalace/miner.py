@@ -7,6 +7,7 @@ Routes each file to the right room based on content.
 Stores verbatim chunks as drawers. No summaries. Ever.
 """
 
+import errno
 import os
 import re
 import sys
@@ -45,7 +46,6 @@ from .palace import (
 from .collision_scan import assert_no_collisions
 from .hallways import compute_hallways_for_wing
 from .ids import ID_RECIPE, make_drawer_id_from_chunk
-from .subject_router import SubjectRouter
 
 logger = logging.getLogger("mempalace_mcp")
 
@@ -58,19 +58,45 @@ def _path_within_root(path: Path, root: Path) -> bool:
         return False
 
 
-def _read_text_no_follow(filepath: Path, root: Path) -> Optional[str]:
+def _read_text_no_follow(filepath: Path, root: Path) -> Optional[tuple[str, float]]:
+    """Read ``filepath`` and return ``(content, mtime)`` from the SAME
+    ``fstat()`` call that validated the file, so callers never need a
+    separate, later ``os.path.getmtime()`` that could observe a file
+    modified in between (see #22: a stale re-stat lets appended content
+    be silently and permanently skipped)."""
     if not _path_within_root(filepath, root):
         return None
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    # O_NONBLOCK is what makes the S_ISREG check below reachable. Opening a
+    # FIFO for reading parks in the kernel until a writer shows up, so
+    # without it the fstat never runs and a named pipe carrying a
+    # READABLE_EXTENSIONS suffix wedges the mine forever. With it the open
+    # returns immediately and the *file type* decides — no errno guesswork,
+    # and a FIFO that does have a live writer is rejected just the same.
+    # Linux open(2): "this flag has no effect for regular files and block
+    # devices". POSIX leaves it unspecified outside FIFOs and special files,
+    # and one Linux case is not a no-op — see the EAGAIN branch below.
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     fd = -1
     try:
-        fd = os.open(filepath, flags)
+        try:
+            fd = os.open(filepath, flags)
+        except OSError as exc:
+            # A reader that breaks a write lease gets EAGAIN when it passes
+            # O_NONBLOCK, where a blocking open waits out lease-break-time
+            # and succeeds. The kernel grants leases on regular files only
+            # (F_SETLEASE on a pipe gives ENXIO), so re-check the type and
+            # then read it the way this code did before the flag existed;
+            # dropping it would silently lose a file that used to be mined.
+            if exc.errno != errno.EAGAIN or not stat.S_ISREG(os.lstat(filepath).st_mode):
+                raise
+            fd = os.open(filepath, flags & ~getattr(os, "O_NONBLOCK", 0))
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_FILE_SIZE:
             return None
+        mtime = st.st_mtime
         with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as f:
             fd = -1
-            return f.read()
+            return f.read(), mtime
     except OSError:
         return None
     finally:
@@ -487,10 +513,14 @@ def load_config(project_dir: str) -> dict:
 
     resolved_project_dir = Path(project_dir).expanduser().resolve()
     config_path = resolved_project_dir / "mempalace.yaml"
-    if not config_path.exists():
+    # ``is_file()`` rather than ``exists()``: the latter is true for a FIFO,
+    # and the ``open`` at the end of this function would then block in the
+    # kernel until a writer appears. A config that is not a regular file is
+    # treated as absent, which lands on the auto-detected defaults below.
+    if not config_path.is_file():
         # Fallback to legacy name
         legacy_path = resolved_project_dir / "mempal.yaml"
-        if legacy_path.exists():
+        if legacy_path.is_file():
             config_path = legacy_path
         else:
             from .config import normalize_wing_name
@@ -1369,7 +1399,7 @@ def _build_drawer_metadata(
     line_start: Optional[int] = None,
     line_end: Optional[int] = None,
     content_date: Optional[str] = None,
-    source_root: Optional[str] = None,
+    chunk_total: Optional[int] = None,
 ) -> dict:
     """Build the metadata dict for one drawer without upserting.
 
@@ -1385,6 +1415,14 @@ def _build_drawer_metadata(
     (legacy callers, pre-Tier-6a drawers), the keys are absent from the
     returned dict and downstream code falls back to ``filed_at`` for the
     date and the 3-segment closet pointer format.
+
+    ``chunk_total`` — the total number of chunks this mining pass expects
+    to write for ``source_file`` (see #21). Every chunk of the same pass
+    carries the same value so ``file_already_mined`` can tell "N of N
+    batches committed" from "crashed after batch 1 of N", instead of
+    treating any surviving drawer with a matching mtime as proof the file
+    is fully mined. ``None`` for legacy callers (e.g. ``add_drawer``,
+    which is inherently a single atomic write with no partial-batch risk).
     """
     metadata = {
         "wing": wing,
@@ -1395,10 +1433,7 @@ def _build_drawer_metadata(
         "filed_at": datetime.now().isoformat(),
         "normalize_version": NORMALIZE_VERSION,
         "id_recipe": ID_RECIPE,
-        "ingest_mode": "projects",
     }
-    if source_root is not None:
-        metadata["source_root"] = source_root
     if source_mtime is not None:
         metadata["source_mtime"] = source_mtime
     if line_start is not None:
@@ -1407,6 +1442,8 @@ def _build_drawer_metadata(
         metadata["line_end"] = line_end
     if content_date:
         metadata["content_date"] = content_date
+    if chunk_total is not None:
+        metadata["chunk_total"] = chunk_total
     metadata["hall"] = detect_hall(content)
     entities = _extract_entities_for_metadata(content)
     if entities:
@@ -1457,7 +1494,6 @@ def process_file(
     chunk_overlap: int = None,
     min_chunk_size: int = None,
     max_chunks_per_file: Optional[int] = None,
-    subject_router: Optional[SubjectRouter] = None,
 ) -> tuple:
     """Read, chunk, route, and file one file.
 
@@ -1475,9 +1511,10 @@ def process_file(
     if not dry_run and file_already_mined(collection, source_file, check_mtime=True):
         return 0, "general", None
 
-    content = _read_text_no_follow(filepath, project_path)
-    if content is None:
+    read_result = _read_text_no_follow(filepath, project_path)
+    if read_result is None:
         return 0, "general", None
+    content, read_mtime = read_result
 
     content = content.strip()
     if len(content) < effective_min:
@@ -1507,32 +1544,8 @@ def process_file(
         )
         return 0, room, "chunk_cap"
 
-    if subject_router is not None:
-        for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
-            batch = chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
-            routes = subject_router.route_many([chunk["content"] for chunk in batch])
-            if len(routes) != len(batch):
-                raise RuntimeError("subject router did not classify every project chunk")
-            for chunk, route in zip(batch, routes):
-                chunk["room"] = route.room
-                chunk["subject_route"] = route.method
-                chunk["subject_score"] = route.score
-        routed_counts = defaultdict(int)
-        for chunk in chunks:
-            routed_counts[chunk["room"]] += 1
-        room = max(routed_counts, key=routed_counts.get)
-
     if dry_run:
-        if subject_router is not None:
-            rooms_text = ", ".join(
-                f"{name}:{count}"
-                for name, count in sorted(
-                    routed_counts.items(), key=lambda item: (-item[1], item[0])
-                )
-            )
-            print(f"    [DRY RUN] {filepath.name} -> {len(chunks)} drawers ({rooms_text})")
-        else:
-            print(f"    [DRY RUN] {filepath.name} -> room:{room} ({len(chunks)} drawers)")
+        print(f"    [DRY RUN] {filepath.name} -> room:{room} ({len(chunks)} drawers)")
         return len(chunks), room, None
 
     # Lock this file so concurrent agents don't interleave delete+insert.
@@ -1548,19 +1561,34 @@ def process_file(
         # hnswlib's thread-unsafe updatePoint path and can segfault on macOS ARM
         # with chromadb 0.6.3) into a clean delete+insert, bypassing the update
         # path entirely.
+        #
+        # A failed purge must abort this file's mine attempt rather than fall
+        # through to upsert: proceeding would either leave stale tail entries
+        # as permanent orphans (old chunk count > new) or silently overwrite
+        # only the overlapping chunk_index positions (not a real re-mine) --
+        # see #23. Returning here (without touching source_mtime/chunk_total)
+        # leaves the old drawers' stored mtime untouched, so the next mine
+        # still sees a mismatch against the current on-disk mtime and retries.
         try:
             collection.delete(where={"source_file": source_file})
-        except Exception:
+        except Exception as exc:
+            print(
+                f"  ! [skip] {filepath.name[:50]:50} stale-drawer purge failed "
+                f"({exc!r}); leaving existing drawers untouched, will retry "
+                f"on the next mine",
+                file=sys.stderr,
+            )
             logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
+            return 0, room, None
 
-        # Batch chunks into bounded upserts so the embedding model sees many
-        # chunks per forward pass without building one huge Chroma/SQLite
-        # request for pathological files. A bad chunk can fail its sub-batch;
-        # that is the deliberate trade-off for amortizing embedding overhead.
-        try:
-            source_mtime = os.path.getmtime(source_file)
-        except OSError:
-            source_mtime = None
+        # source_mtime is the mtime paired with the content actually read
+        # above (from _read_text_no_follow's own fstat), not a fresh re-stat
+        # here -- see #22. Re-statting separately can observe a file that was
+        # appended to between the read and this point, stamping drawers with
+        # an mtime that doesn't match what was actually chunked; the next
+        # mine's freshness check then sees stored-mtime == current-disk-mtime
+        # and silently, permanently skips the appended tail.
+        source_mtime = read_mtime
 
         # Tier 6a content-date: extract once per file (not per chunk) and
         # share across all chunks. Reads filename / frontmatter / content /
@@ -1575,119 +1603,99 @@ def process_file(
         # in production and the 4-segment pointer form lives only in tests.
         # Per PR #1584 review (Igor, 2026-05-22).
         all_metas: list = []
-        for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
-            batch_docs: list = []
-            batch_ids: list = []
-            batch_metas: list = []
-            for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
-                chunk_room = chunk.get("room", room)
-                drawer_id = make_drawer_id_from_chunk(
-                    wing, chunk_room, source_file, chunk["chunk_index"]
-                )
-                batch_docs.append(chunk["content"])
-                batch_ids.append(drawer_id)
-                metadata = _build_drawer_metadata(
-                    wing,
-                    chunk_room,
-                    source_file,
-                    chunk["chunk_index"],
-                    agent,
-                    chunk["content"],
-                    source_mtime,
-                    line_start=chunk.get("line_start"),
-                    line_end=chunk.get("line_end"),
-                    content_date=file_content_date,
-                    source_root=str(project_path.resolve()),
-                )
-                if subject_router is not None:
-                    metadata.update(
-                        {
-                            "subject_policy": subject_router.fingerprint,
-                            "subject_route": chunk["subject_route"],
-                            "subject_score": float(chunk["subject_score"]),
-                        }
+        try:
+            for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
+                batch_docs: list = []
+                batch_ids: list = []
+                batch_metas: list = []
+                for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
+                    drawer_id = make_drawer_id_from_chunk(
+                        wing, room, source_file, chunk["chunk_index"]
                     )
-                batch_metas.append(metadata)
-            assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
-            collection.upsert(
-                documents=batch_docs,
-                ids=batch_ids,
-                metadatas=batch_metas,
-            )
-            drawers_added += len(batch_docs)
-            all_metas.extend(batch_metas)
+                    batch_docs.append(chunk["content"])
+                    batch_ids.append(drawer_id)
+                    batch_metas.append(
+                        _build_drawer_metadata(
+                            wing,
+                            room,
+                            source_file,
+                            chunk["chunk_index"],
+                            agent,
+                            chunk["content"],
+                            source_mtime,
+                            line_start=chunk.get("line_start"),
+                            line_end=chunk.get("line_end"),
+                            content_date=file_content_date,
+                            chunk_total=len(chunks),
+                        )
+                    )
+                assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
+                collection.upsert(
+                    documents=batch_docs,
+                    ids=batch_ids,
+                    metadatas=batch_metas,
+                )
+                drawers_added += len(batch_docs)
+                all_metas.extend(batch_metas)
+        except Exception:
+            # A successful earlier batch has the source's current mtime (and
+            # often chunk_total). Leaving those drawers behind would make the
+            # next run skip this incomplete rebuild when chunk_total is absent
+            # on legacy rows, and would leave partial content searchable until
+            # the next mine. The source lock prevents this cleanup from
+            # deleting another miner's work for the same file. (#2122)
+            try:
+                collection.delete(where={"source_file": source_file})
+            except Exception:
+                logger.warning(
+                    "Failed to clean partial drawers after upsert error for %s",
+                    source_file,
+                    exc_info=True,
+                )
+            if closets_col:
+                purge_file_closets(closets_col, source_file)
+            raise
 
         # Build closet — the searchable index pointing to these drawers.
-        # Purge first: a re-mine (mtime change or normalize_version bump) must
-        # fully replace the prior closets, not append to them.
-        if closets_col and drawers_added > 0:
+        # Purge unconditionally: the old drawers this closet pointed at were
+        # already deleted above regardless of how many chunks survived this
+        # pass's own length filter, so a re-mine that ends up with zero filed
+        # drawers must still end up with zero closets, not stale ones
+        # dangling on deleted drawer IDs (see #24). Only the closet
+        # rebuild itself is conditional on there being new drawers to point at.
+        if closets_col:
             purge_file_closets(closets_col, source_file)
-            if subject_router is None:
-                drawer_ids = [
-                    make_drawer_id_from_chunk(wing, room, source_file, chunk["chunk_index"])
-                    for chunk in chunks
-                ]
-                closet_lines = build_closet_lines(
-                    source_file,
-                    drawer_ids,
-                    content,
-                    wing,
-                    room,
-                    drawer_metas=all_metas,
-                )
-                closet_id_base = (
-                    f"closet_{wing}_{room}_{hashlib.sha256(source_file.encode()).hexdigest()[:24]}"
-                )
-                closet_meta = {
-                    "wing": wing,
-                    "room": room,
-                    "source_file": source_file,
-                    "drawer_count": len(chunks),
-                    "filed_at": datetime.now().isoformat(),
-                    "normalize_version": NORMALIZE_VERSION,
-                }
-                entities = _extract_entities_for_metadata(content)
-                if entities:
-                    closet_meta["entities"] = entities
-                upsert_closet_lines(closets_col, closet_id_base, closet_lines, closet_meta)
-                return drawers_added, room, None
-            room_chunks: dict[str, list[tuple[dict, dict]]] = defaultdict(list)
-            for chunk, metadata in zip(chunks, all_metas):
-                room_chunks[metadata["room"]].append((chunk, metadata))
-            for closet_room, grouped in room_chunks.items():
-                grouped_chunks = [item[0] for item in grouped]
-                grouped_metas = [item[1] for item in grouped]
-                drawer_ids = [
-                    make_drawer_id_from_chunk(wing, closet_room, source_file, chunk["chunk_index"])
-                    for chunk in grouped_chunks
-                ]
-                room_content = "\n\n".join(chunk["content"] for chunk in grouped_chunks)
-                closet_lines = build_closet_lines(
-                    source_file,
-                    drawer_ids,
-                    room_content,
-                    wing,
-                    closet_room,
-                    drawer_metas=grouped_metas,
-                )
-                closet_id_base = (
-                    f"closet_{wing}_{closet_room}_"
-                    f"{hashlib.sha256(source_file.encode()).hexdigest()[:24]}"
-                )
-                entities = _extract_entities_for_metadata(room_content)
-                closet_meta = {
-                    "wing": wing,
-                    "room": closet_room,
-                    "source_file": source_file,
-                    "drawer_count": len(grouped_chunks),
-                    "filed_at": datetime.now().isoformat(),
-                    "normalize_version": NORMALIZE_VERSION,
-                }
-                if subject_router is not None:
-                    closet_meta["subject_policy"] = subject_router.fingerprint
-                if entities:
-                    closet_meta["entities"] = entities
-                upsert_closet_lines(closets_col, closet_id_base, closet_lines, closet_meta)
+        if closets_col and drawers_added > 0:
+            drawer_ids = [
+                make_drawer_id_from_chunk(wing, room, source_file, c["chunk_index"]) for c in chunks
+            ]
+            # Pass drawer_metas so build_closet_lines can emit the Tier 6a
+            # 4-segment pointer (``topic|entities|YYYY-MM-DD:Lstart-Lend|→ids``)
+            # when line_start / line_end / content_date are present. Falls
+            # back to the legacy 3-segment form automatically when not.
+            closet_lines = build_closet_lines(
+                source_file,
+                drawer_ids,
+                content,
+                wing,
+                room,
+                drawer_metas=all_metas,
+            )
+            closet_id_base = (
+                f"closet_{wing}_{room}_{hashlib.sha256(source_file.encode()).hexdigest()[:24]}"
+            )
+            entities = _extract_entities_for_metadata(content)
+            closet_meta = {
+                "wing": wing,
+                "room": room,
+                "source_file": source_file,
+                "drawer_count": drawers_added,
+                "filed_at": datetime.now().isoformat(),
+                "normalize_version": NORMALIZE_VERSION,
+            }
+            if entities:
+                closet_meta["entities"] = entities
+            upsert_closet_lines(closets_col, closet_id_base, closet_lines, closet_meta)
 
     return drawers_added, room, None
 
@@ -1785,7 +1793,19 @@ def scan_project(
             # match the SKIP: (symlink) line above; silent drops at this
             # gate were the original #923 complaint.
             try:
-                file_size = filepath.stat().st_size
+                file_stat = filepath.stat()
+                # Reject anything that is not a regular file before it can
+                # reach a reader. os.walk lists FIFOs, sockets and device
+                # nodes as plain filenames and the extension filter above
+                # decides by name, so ``notes.md`` can be a named pipe.
+                # stat() itself never blocks on one; opening it can.
+                if not stat.S_ISREG(file_stat.st_mode):
+                    print(
+                        f"  SKIP: {filepath.name} (not a regular file)",
+                        file=sys.stderr,
+                    )
+                    continue
+                file_size = file_stat.st_size
                 if file_size > MAX_FILE_SIZE:
                     print(
                         f"  SKIP: {filepath.name} ({file_size / (1024 * 1024):.1f} MB)"
@@ -1824,7 +1844,6 @@ def mine(
     include_ignored: list = None,
     files: list = None,
     max_chunks_per_file: Optional[int] = None,
-    subject_routing: bool = False,
 ):
     """Mine a project directory into the palace.
 
@@ -1851,7 +1870,6 @@ def mine(
             include_ignored=include_ignored,
             files=files,
             max_chunks_per_file=max_chunks_per_file,
-            subject_routing=subject_routing,
         )
 
     # MineAlreadyRunning propagates so the CLI can render a clear holder-aware
@@ -1869,7 +1887,6 @@ def mine(
             include_ignored=include_ignored,
             files=files,
             max_chunks_per_file=max_chunks_per_file,
-            subject_routing=subject_routing,
         )
 
 
@@ -1884,14 +1901,12 @@ def _mine_impl(
     include_ignored: list = None,
     files: list = None,
     max_chunks_per_file: Optional[int] = None,
-    subject_routing: bool = False,
 ):
     from .config import MempalaceConfig
 
     project_path = Path(project_dir).expanduser().resolve()
     config = load_config(project_dir)
     palace_config = MempalaceConfig()
-    subject_router = SubjectRouter.from_env() if subject_routing else None
 
     cfg_chunk_size = palace_config.chunk_size
     cfg_chunk_overlap = palace_config.chunk_overlap
@@ -1968,7 +1983,6 @@ def _mine_impl(
                     # otherwise a malformed env var would emit its warning
                     # per file.
                     max_chunks_per_file=effective_chunk_cap,
-                    subject_router=subject_router,
                 )
             except KeyboardInterrupt:
                 # Re-raise so the outer handler prints the summary; we

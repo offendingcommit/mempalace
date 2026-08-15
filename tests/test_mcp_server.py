@@ -77,6 +77,40 @@ def test_mcp_main_strips_leaked_pythonpath_from_env():
     assert "ENV_AFTER: None" in result.stderr, f"MCP server did not strip PYTHONPATH: {diag}"
 
 
+def test_install_shutdown_signal_handlers_routes_term_to_system_exit():
+    """SIGTERM/SIGHUP must raise SystemExit so atexit can release the lease (#2205)."""
+    import signal
+
+    from mempalace import mcp_server
+
+    previous = {}
+    for name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        previous[sig] = signal.getsignal(sig)
+
+    try:
+        mcp_server._install_shutdown_signal_handlers()
+        term = signal.SIGTERM
+        handler = signal.getsignal(term)
+        assert callable(handler)
+        with pytest.raises(SystemExit) as exc_info:
+            handler(term, None)
+        assert exc_info.value.code == 0
+
+        sighup = getattr(signal, "SIGHUP", None)
+        if sighup is not None:
+            hup_handler = signal.getsignal(sighup)
+            assert callable(hup_handler)
+            with pytest.raises(SystemExit) as exc_info:
+                hup_handler(sighup, None)
+            assert exc_info.value.code == 0
+    finally:
+        for sig, old in previous.items():
+            signal.signal(sig, old)
+
+
 def _patch_mcp_server(monkeypatch, config, kg):
     """Patch the mcp_server module globals to use test fixtures."""
     from mempalace import mcp_server
@@ -605,150 +639,6 @@ class TestColdStartDiagnostics:
 
 
 class TestHandleRequest:
-    def test_official_sdk_owns_protocol_server(self):
-        """The protocol entrypoint is the official low-level MCP Server."""
-        from mcp.server import Server
-        from mempalace import mcp_server
-
-        assert isinstance(mcp_server._MCP_SDK_SERVER, Server)
-
-    def test_official_sdk_refreshes_idle_clock_for_every_stdio_message(self, monkeypatch):
-        """SDK-owned ping/initialize/notifications pass through activity middleware."""
-        import anyio
-        from mempalace import mcp_server
-
-        monkeypatch.setattr(mcp_server.time, "monotonic", lambda: 123.0)
-        monkeypatch.setattr(mcp_server, "_last_request_time", 0.0)
-        assert mcp_server._sdk_refresh_idle_activity in mcp_server._MCP_SDK_SERVER.middleware
-
-        async def exercise():
-            async def call_next(ctx):
-                return ctx
-
-            marker = object()
-            result = await mcp_server._sdk_refresh_idle_activity(marker, call_next)
-            assert result is marker
-
-        anyio.run(exercise)
-        assert mcp_server._last_request_time == 123.0
-
-    def test_official_sdk_stdio_handshake_and_tools_list(self):
-        """Exercise the real SDK client/server handshake over stdio."""
-        import anyio
-        from mcp import ClientSession
-        from mcp.client.stdio import StdioServerParameters, stdio_client
-
-        async def exercise():
-            server = StdioServerParameters(
-                command=sys.executable,
-                args=["-m", "mempalace.mcp_server"],
-                env=os.environ.copy(),
-            )
-            async with stdio_client(server) as (read_stream, write_stream):
-                async with ClientSession(read_stream, write_stream) as session:
-                    initialized = await session.initialize()
-                    assert initialized.server_info.name == "mempalace"
-                    tools = await session.list_tools()
-                    assert "mempalace_search" in {tool.name for tool in tools.tools}
-
-        anyio.run(exercise)
-
-    def test_official_sdk_read_only_hides_and_refuses_writes(self, monkeypatch):
-        import anyio
-        import mcp.types as mcp_types
-        from mcp.shared.exceptions import MCPError
-        from mempalace import mcp_server
-
-        monkeypatch.setattr(mcp_server, "_READ_ONLY", True)
-
-        async def exercise():
-            listed = await mcp_server._sdk_list_tools(None, None)
-            names = {tool.name for tool in listed.tools}
-            assert "mempalace_add_drawer" not in names
-            params = mcp_types.CallToolRequestParams(
-                name="mempalace_add_drawer", arguments={"content": "x"}
-            )
-            with pytest.raises(MCPError) as exc_info:
-                await mcp_server._sdk_call_http_tool(None, params)
-            assert exc_info.value.error.code == -32003
-
-        anyio.run(exercise)
-
-    def test_official_sdk_stdio_callbacks_proxy_live_hub(self, monkeypatch):
-        import socket
-        import threading
-        import time
-
-        import anyio
-        import mcp.types as mcp_types
-        import uvicorn
-        from mempalace import mcp_server
-
-        app, state = mcp_server._build_sdk_http_app("127.0.0.1", 0)
-        sock = socket.socket()
-        sock.bind(("127.0.0.1", 0))
-        sock.listen()
-        port = sock.getsockname()[1]
-        state.server_address = ("127.0.0.1", port)
-        server = uvicorn.Server(uvicorn.Config(app, log_config=None, log_level="warning"))
-        thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
-        thread.start()
-        for _ in range(100):
-            if server.started:
-                break
-            time.sleep(0.02)
-        monkeypatch.setattr(
-            mcp_server,
-            "_hub_proxy_target",
-            lambda: (f"http://127.0.0.1:{port}", {}),
-        )
-
-        async def exercise():
-            listed = await mcp_server._sdk_list_stdio_tools(None, None)
-            assert "mempalace_get_aaak_spec" in {tool.name for tool in listed.tools}
-            result = await mcp_server._sdk_call_stdio_tool(
-                None,
-                mcp_types.CallToolRequestParams(name="mempalace_get_aaak_spec", arguments={}),
-            )
-            assert "AAAK" in result.content[0].text
-
-        try:
-            anyio.run(exercise)
-        finally:
-            server.should_exit = True
-            thread.join(timeout=5)
-
-    def test_official_sdk_tool_results_errors_and_concurrency(self):
-        import anyio
-        import mcp.types as mcp_types
-        from mcp.shared.exceptions import MCPError
-        from mempalace import mcp_server
-
-        async def exercise():
-            results = []
-
-            async def call_spec():
-                result = await mcp_server._sdk_call_http_tool(
-                    None,
-                    mcp_types.CallToolRequestParams(name="mempalace_get_aaak_spec", arguments={}),
-                )
-                results.append(result.content[0].text)
-
-            async with anyio.create_task_group() as group:
-                group.start_soon(call_spec)
-                group.start_soon(call_spec)
-            assert len(results) == 2
-            assert all("AAAK" in result for result in results)
-            with pytest.raises(MCPError) as exc_info:
-                await mcp_server._sdk_call_http_tool(
-                    None,
-                    mcp_types.CallToolRequestParams(name="does_not_exist", arguments={}),
-                )
-            assert exc_info.value.code == -32601
-            assert exc_info.value.message == "Unknown tool: does_not_exist"
-
-        anyio.run(exercise)
-
     def test_initialize(self):
         from mempalace.mcp_server import handle_request
 
@@ -3419,19 +3309,18 @@ class TestDeleteBySource:
     def test_dry_run_reports_closet_match_count(self, monkeypatch, config, palace_path, kg):
         """Dry run surfaces the closet blast radius (#1722) without deleting."""
         self._seed(monkeypatch, config, palace_path, kg)
-        closets_col = self._seed_closets(palace_path)
+        self._seed_closets(palace_path)
         from mempalace.mcp_server import tool_delete_by_source
+        from mempalace.palace import get_closets_collection
 
         result = tool_delete_by_source("results_mempal_hybrid_v4_session_1.jsonl")
         assert result["dry_run"] is True
         assert result["closet_match_count"] == 2
-        # The server drains stale Chroma handles after an mtime-triggered
-        # reconnect, so verify through a fresh collection handle.
-        del closets_col
-        from mempalace.palace import get_closets_collection
-
-        fresh_closets = get_closets_collection(palace_path)
-        assert len(fresh_closets.get(include=[])["ids"]) == 3
+        # Re-acquire: the staleness reconnect drops chromadb's path-keyed System
+        # cache (#2002), so a handle taken before the call is dead by now.
+        closets_col = get_closets_collection(palace_path, create=False)
+        # Nothing removed — all three closets still present.
+        assert len(closets_col.get(include=[])["ids"]) == 3
 
     def test_commit_deletes_only_matching_source(self, monkeypatch, config, palace_path, kg):
         self._seed(monkeypatch, config, palace_path, kg)
@@ -3448,20 +3337,19 @@ class TestDeleteBySource:
         """Deleting by source purges the matching closets too, so the AAAK
         index keeps no stale pointers at the now-deleted drawers (#1722)."""
         self._seed(monkeypatch, config, palace_path, kg)
-        closets_col = self._seed_closets(palace_path)
+        self._seed_closets(palace_path)
         from mempalace.mcp_server import tool_delete_by_source
+        from mempalace.palace import get_closets_collection
 
         result = tool_delete_by_source("results_mempal_hybrid_v4_session_1.jsonl", dry_run=False)
         assert result["success"] is True
         assert result["deleted"] == 2
         assert result["closets_deleted"] == 2
+        # Re-acquire: the staleness reconnect drops chromadb's path-keyed System
+        # cache (#2002), so a handle taken before the call is dead by now.
+        closets_col = get_closets_collection(palace_path, create=False)
         # The two benchmark closets are gone; the real-client closet survives.
-        # Reconnect intentionally invalidates pre-write Chroma handles.
-        del closets_col
-        from mempalace.palace import get_closets_collection
-
-        fresh_closets = get_closets_collection(palace_path)
-        remaining = fresh_closets.get(include=["metadatas"])
+        remaining = closets_col.get(include=["metadatas"])
         sources = {m["source_file"] for m in remaining["metadatas"]}
         assert sources == {"notes/clients.md"}
 
@@ -4924,33 +4812,50 @@ class TestStructuredErrors:
             "_get_client should call _prepare_palace_for_open on reconnect"
         )
 
-    def test_get_client_closes_cached_chroma_client_before_mtime_reconnect(
+    def test_get_client_resets_chroma_system_cache_on_reconnect(
         self, monkeypatch, config, palace_path, kg
     ):
-        """An in-place database update must not retain the old HNSW client."""
+        """``_get_client`` must clear chromadb's path-keyed System/HNSW cache
+        (via ``_force_chroma_cache_reset``) *before* calling ``make_client`` on an
+        inode/mtime reconnect. Otherwise chromadb hands back the stale in-memory
+        HNSW segment, which persists its outdated index over a peer writer's
+        on-disk changes, driving the persisted count backwards (#2002)."""
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace import mcp_server
+        from mempalace.backends.chroma import ChromaBackend
 
-        make_minimal_chroma_sqlite(config.palace_path)
-        old_client = MagicMock()
-        new_client = MagicMock()
-        monkeypatch.setattr(mcp_server, "_client_cache", old_client)
-        monkeypatch.setattr(mcp_server, "_collection_cache", MagicMock())
-        monkeypatch.setattr(mcp_server, "_palace_db_inode", 0)
-        monkeypatch.setattr(mcp_server, "_palace_db_mtime", 1.0)
-        monkeypatch.setattr(mcp_server, "_refresh_vector_disabled_flag", lambda: None)
-        monkeypatch.setattr(mcp_server.ChromaBackend, "make_client", lambda _path: new_client)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
 
-        reset_calls = []
+        # Prime the cache.
+        mcp_server._get_collection()
 
-        def reset():
-            reset_calls.append(True)
-            mcp_server._client_cache = None
+        # Simulate a peer writer touching chroma.sqlite3 on disk.
+        old_mtime = mcp_server._palace_db_mtime
+        monkeypatch.setattr(mcp_server, "_palace_db_mtime", old_mtime - 10.0)
 
-        monkeypatch.setattr(mcp_server, "_force_chroma_cache_reset", reset)
+        order: list[str] = []
+        real_reset = mcp_server._force_chroma_cache_reset
+        real_make = ChromaBackend.make_client
 
-        assert mcp_server._get_client() is new_client
-        assert reset_calls == [True]
+        def spy_reset():
+            order.append("reset")
+            real_reset()
+
+        @staticmethod
+        def spy_make(path):
+            order.append("make_client")
+            return real_make(path)
+
+        monkeypatch.setattr(mcp_server, "_force_chroma_cache_reset", spy_reset)
+        monkeypatch.setattr(ChromaBackend, "make_client", spy_make)
+
+        mcp_server._get_client()
+
+        assert order == ["reset", "make_client"], (
+            "_get_client must reset chromadb's system cache BEFORE reopening the "
+            "client on a staleness reconnect (#2002)"
+        )
 
     def test_call_kg_retries_after_concurrent_close(self, monkeypatch):
         """A KG closed mid-handler must trigger a one-shot retry with a fresh

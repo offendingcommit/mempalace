@@ -1020,6 +1020,7 @@ def _file_chunks_locked(
             normalized_chunk_size,
             expected_chunk_count,
         )
+        written_ids: list[str] = []
         chunk_iterator = iter(chunks) if target_needs_upsert else iter(())
         while batch := list(islice(chunk_iterator, DRAWER_UPSERT_BATCH_SIZE)):
             batch_docs: list = []
@@ -1066,6 +1067,7 @@ def _file_chunks_locked(
                     "extract_mode": extract_mode,
                     "normalize_version": NORMALIZE_VERSION,
                     "id_recipe": ID_RECIPE,
+                    "chunk_total": len(chunks),
                 }
                 if source_mtime is not None:
                     meta["source_mtime"] = source_mtime
@@ -1114,8 +1116,15 @@ def _file_chunks_locked(
                     metadatas=batch_metas,
                 )
                 drawers_added += len(batch_docs)
+                written_ids.extend(batch_ids)
             except Exception as e:
                 if "already exists" not in str(e).lower():
+                    # Preserve a previously committed normalized generation,
+                    # but never leave this attempt's successful earlier batches
+                    # looking complete after a later batch fails (#2183).
+                    cleanup_ids = list(dict.fromkeys([*written_ids, *batch_ids]))
+                    if cleanup_ids:
+                        collection.delete(ids=cleanup_ids)
                     raise
 
         if normalized is not None:
