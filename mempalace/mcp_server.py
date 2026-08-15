@@ -993,7 +993,10 @@ def _get_client():
     inode_changed = current_inode != 0 and current_inode != _palace_db_inode
     mtime_changed = current_mtime != 0.0 and abs(current_mtime - _palace_db_mtime) > 0.01
 
+    replacing_cached_client = _client_cache is not None and (inode_changed or mtime_changed)
     if _client_cache is None or inode_changed or mtime_changed:
+        if replacing_cached_client:
+            _force_chroma_cache_reset()
         # Run the HNSW capacity probe BEFORE chromadb opens the segment --
         # if the index is severely undersized, segment load can segfault
         # the whole MCP server (#1222). The probe is pure sqlite +
