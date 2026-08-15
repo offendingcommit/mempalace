@@ -131,3 +131,27 @@ Knowledge Graph:
 - **Adding a storage backend**: subclass `mempalace/backends/base.py`, register in `backends/__init__.py`
 - **Input validation**: `mempalace/config.py` — `sanitize_name()` / `sanitize_content()`
 - **Tests**: mirror source structure in `tests/test_<module>.py`
+
+## Local Validation Before Push
+
+- Do not push a repository change until the affected behavior has been
+  validated locally at every boundary the hosted workflows exercise.
+- Start with focused regression tests, then run the complete non-benchmark
+  suite: `uv run pytest tests/ -q --ignore=tests/benchmarks`.
+- Run both Ruff gates: `uv run ruff check .` and
+  `uv run ruff format --check .`.
+- For changes that affect packaging, dependencies, MCP startup, runtime I/O,
+  or container behavior, also build the applicable CPU/GPU images and run
+  `scripts/docker-smoke.sh` against the built CPU image. Match CI's target
+  architecture when it differs from the local host.
+- A focused pass or a green root build does not replace validation of the
+  affected artifact boundary. Fix every locally reproducible failure before
+  pushing; document any check that cannot be run and why.
+
+## Fork Pull Requests
+
+- This checkout's release chain belongs to `offendingcommit/mempalace`.
+  Create pull requests against that repository unless the user explicitly
+  requests an upstream contribution to `MemPalace/mempalace`.
+- Before creating a PR, verify the base repository and branch explicitly.
+  Do not rely on `gh` to infer the target from an upstream remote.
