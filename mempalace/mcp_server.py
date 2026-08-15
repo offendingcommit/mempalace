@@ -7371,6 +7371,7 @@ def _http_record_request(httpd, handler, status: int) -> None:
 
 def _record_sdk_http_request(httpd, scope: dict, headers: dict, status: int) -> None:
     """Record the same status/client metadata for the SDK ASGI transport."""
+    status = int(status)
     now = time.time()
     peer = (scope.get("client") or ("", 0))[0]
     forwarded_for = headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
