@@ -1548,6 +1548,33 @@ def _close_client(client) -> None:
         logger.debug("client.close() unavailable or failed", exc_info=True)
 
 
+def _clear_chroma_system_cache() -> None:
+    """Drop chromadb's process-global ``SharedSystemClient`` cache.
+
+    chromadb caches its ``System`` (and the live HNSW segment) keyed by path.
+    A bare ``chromadb.PersistentClient(path=...)`` reopen reuses that cached
+    System, so after a peer/rebuild has changed ``chroma.sqlite3`` on disk we
+    would rebuild against the stale in-memory segment and persist an outdated
+    index over the on-disk changes -- the same data-loss class as #2002,
+    reached via :meth:`ChromaBackend._client` instead of
+    ``mcp_server._get_client``. This mirrors the reset already performed by
+    ``mcp_server._force_chroma_cache_reset`` and ``repair._close_chroma_handles``.
+
+    The clear is process-global (it evicts every palace's cached System, not
+    just this path); chromadb exposes no per-path eviction. It only fires on the
+    inode/mtime-change branch of ``_client``, never the steady-state hot path,
+    so the redundant rebuild cost is bounded to genuine external-change reopens.
+    """
+    try:
+        from chromadb.api.client import SharedSystemClient
+
+        clear = getattr(SharedSystemClient, "clear_system_cache", None)
+        if callable(clear):
+            clear()
+    except Exception:
+        logger.debug("Failed to clear chromadb SharedSystemClient cache", exc_info=True)
+
+
 class ChromaCollection(BaseCollection):
     """Thin adapter translating ChromaDB dict returns into typed results.
 
@@ -1568,9 +1595,14 @@ class ChromaCollection(BaseCollection):
     directly without going through ``ChromaBackend``.
     """
 
-    def __init__(self, collection, palace_path: Optional[str] = None):
+    def __init__(self, collection, palace_path: Optional[str] = None, after_write=None):
         self._collection = collection
         self._palace_path = palace_path
+        self._after_write = after_write
+
+    def _record_write(self) -> None:
+        if self._after_write is not None:
+            self._after_write()
 
     @contextlib.contextmanager
     def _write_lock(self):
@@ -1662,6 +1694,7 @@ class ChromaCollection(BaseCollection):
             kwargs["embeddings"] = embeddings
         with self._write_lock():
             self._collection.add(**kwargs)
+            self._record_write()
 
     def upsert(self, *, documents, ids, metadatas=None, embeddings=None):
         kwargs: dict[str, Any] = {
@@ -1675,6 +1708,7 @@ class ChromaCollection(BaseCollection):
             kwargs["embeddings"] = embeddings
         with self._write_lock():
             self._collection.upsert(**kwargs)
+            self._record_write()
 
     def update(
         self,
@@ -1695,6 +1729,7 @@ class ChromaCollection(BaseCollection):
             kwargs["embeddings"] = embeddings
         with self._write_lock():
             self._collection.update(**kwargs)
+            self._record_write()
 
     # ------------------------------------------------------------------
     # Reads
@@ -1840,6 +1875,7 @@ class ChromaCollection(BaseCollection):
             kwargs["where"] = where
         with self._write_lock():
             self._collection.delete(**kwargs)
+            self._record_write()
 
     def count(self):
         return self._collection.count()
@@ -2292,6 +2328,19 @@ class ChromaBackend(BaseBackend):
                 or (mtime_appeared and palace_path in self._freshness)
             ):
                 ChromaBackend._quarantined_paths.discard(palace_path)
+                # Release the old client's SQLite and HNSW handles before
+                # clearing chromadb's global system cache. Replacing the dict
+                # entry alone retains one loaded HNSW client per peer write.
+                _close_client(self._clients.pop(palace_path, None))
+                cached = None
+                # #2028: the same external change means chromadb's path-keyed
+                # System cache is now stale. Reconstructing PersistentClient
+                # below would reuse the cached System (and its in-memory HNSW
+                # segment), so drop the shared cache first -- otherwise the
+                # rebuilt client persists an outdated index over the on-disk
+                # change. Gated on genuine external change (not first open) so
+                # cold opens never pay the global-evict cost.
+                _clear_chroma_system_cache()
             ChromaBackend._prepare_palace_for_open(palace_path)
             cached = chromadb.PersistentClient(path=palace_path)
             self._clients[palace_path] = cached
@@ -2441,7 +2490,16 @@ class ChromaBackend(BaseBackend):
                     raise ValueError(explanation) from e
                 raise
         _pin_hnsw_threads(collection)
-        return ChromaCollection(collection, palace_path=palace_path)
+        # Collection creation and migration can write chroma.sqlite3 before
+        # the returned wrapper has a chance to run its after-write callback.
+        self._freshness[palace_path] = self._db_stat(palace_path)
+        return ChromaCollection(
+            collection,
+            palace_path=palace_path,
+            after_write=lambda: self._freshness.__setitem__(
+                palace_path, self._db_stat(palace_path)
+            ),
+        )
 
     def close_palace(self, palace) -> None:
         """Drop cached handles for ``palace`` and release its SQLite file lock.
@@ -2515,7 +2573,13 @@ class ChromaBackend(BaseBackend):
             metadata=_hnsw_creation_metadata({"hnsw_space": hnsw_space}),
             **ef_kwargs,
         )
-        return ChromaCollection(collection, palace_path=palace_path)
+        return ChromaCollection(
+            collection,
+            palace_path=palace_path,
+            after_write=lambda: self._freshness.__setitem__(
+                palace_path, self._db_stat(palace_path)
+            ),
+        )
 
 
 def _normalize_get_collection_args(args, kwargs):

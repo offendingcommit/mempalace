@@ -3,6 +3,7 @@
 import hashlib
 import importlib
 import json
+import os
 
 import pytest
 
@@ -27,7 +28,7 @@ def _write_pair(
         "> teh exact user text must stay teh same\n"
         "The assistant answer also stays byte-for-byte intact.\n"
     )
-    transcript_path.write_text(transcript_text)
+    transcript_path.write_bytes(transcript_text.encode("utf-8"))
     sidecar = {
         "schema": "mempalace-normalized-conversation/v1",
         "room": room,
@@ -41,7 +42,7 @@ def _write_pair(
         "hermes_source": "telegram",
     }
     sidecar_path = tmp_path / "session.md.meta.json"
-    sidecar_path.write_text(json.dumps(sidecar))
+    sidecar_path.write_bytes(json.dumps(sidecar).encode("utf-8"))
     return transcript_path, sidecar_path, transcript_text, sidecar
 
 
@@ -854,7 +855,8 @@ def test_coverage_registry_advances_atomically_and_is_private(tmp_path):
 
     assert committed["wing"] == "wing_amber"
     assert normalized.read_applied_coverage(palace)["wing_amber"] == committed
-    assert registry_path.stat().st_mode & 0o777 == 0o600
+    if os.name != "nt":
+        assert registry_path.stat().st_mode & 0o777 == 0o600
     assert "telegram" in registry_path.read_text()
     before = registry_path.stat().st_mtime_ns
     assert normalized.commit_applied_coverage(palace, _coverage_receipt()) == committed

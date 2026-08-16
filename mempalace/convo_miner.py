@@ -10,6 +10,7 @@ Same palace as project mining. Different ingest strategy.
 
 from __future__ import annotations
 
+import errno
 import os
 import sys
 import json
@@ -200,10 +201,15 @@ def _path_within_root(path: Path, root: Path) -> bool:
 def _is_regular_source_file(filepath: Path, root: Path) -> bool:
     if not _path_within_root(filepath, root):
         return False
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     fd = -1
     try:
-        fd = os.open(filepath, flags)
+        try:
+            fd = os.open(filepath, flags)
+        except OSError as exc:
+            if exc.errno != errno.EAGAIN or not stat.S_ISREG(os.lstat(filepath).st_mode):
+                raise
+            fd = os.open(filepath, flags & ~getattr(os, "O_NONBLOCK", 0))
         st = os.fstat(fd)
         return stat.S_ISREG(st.st_mode) and st.st_size <= MAX_FILE_SIZE
     except OSError:
@@ -864,6 +870,10 @@ def scan_convos(convo_dir: str, include_subagents: bool = False) -> list:
                     )
                     continue
                 if not _is_regular_source_file(filepath, convo_path):
+                    print(
+                        f"  SKIP: {filepath.name} (not a regular file)",
+                        file=sys.stderr,
+                    )
                     continue
                 files.append(filepath)
     return files
@@ -1020,6 +1030,7 @@ def _file_chunks_locked(
             normalized_chunk_size,
             expected_chunk_count,
         )
+        written_ids: list[str] = []
         chunk_iterator = iter(chunks) if target_needs_upsert else iter(())
         while batch := list(islice(chunk_iterator, DRAWER_UPSERT_BATCH_SIZE)):
             batch_docs: list = []
@@ -1066,6 +1077,7 @@ def _file_chunks_locked(
                     "extract_mode": extract_mode,
                     "normalize_version": NORMALIZE_VERSION,
                     "id_recipe": ID_RECIPE,
+                    "chunk_total": expected_chunk_count,
                 }
                 if source_mtime is not None:
                     meta["source_mtime"] = source_mtime
@@ -1114,8 +1126,15 @@ def _file_chunks_locked(
                     metadatas=batch_metas,
                 )
                 drawers_added += len(batch_docs)
+                written_ids.extend(batch_ids)
             except Exception as e:
                 if "already exists" not in str(e).lower():
+                    # Preserve a previously committed normalized generation,
+                    # but never leave this attempt's successful earlier batches
+                    # looking complete after a later batch fails (#2183).
+                    cleanup_ids = list(dict.fromkeys([*written_ids, *batch_ids]))
+                    if cleanup_ids:
+                        collection.delete(ids=cleanup_ids)
                     raise
 
         if normalized is not None:
